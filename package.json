@@ -1,0 +1,42 @@
+{
+  "name": "mcp-generator",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js",
+    "test": "tsx --test src/tests/parser.test.ts src/tests/generate.test.ts src/tests/workflow.test.ts src/tests/rc-app.test.ts src/tests/rc-app-parser.test.ts src/tests/capability-guide.test.ts src/tests/workflow-engine.test.ts",
+    "unregister": "bash scripts/unregister-mcp.sh"
+  },
+  "keywords": [
+    "mcp",
+    "rocketchat",
+    "mcp-generator"
+  ],
+  "author": "sezallagwal",
+  "license": "MIT",
+  "description": "A MCP Server that generates minimal MCP servers",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sezallagwal/mcpGenerator.git"
+  },
+  "homepage": "https://github.com/sezallagwal/mcpGenerator#readme",
+  "bugs": {
+    "url": "https://github.com/sezallagwal/mcpGenerator/issues"
+  },
+  "dependencies": {
+    "@apidevtools/swagger-parser": "^12.1.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "openapi-types": "^12.1.3",
+    "ts-morph": "^27.0.2",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@rocket.chat/apps-engine": "^1.57.2",
+    "@types/node": "^25.3.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

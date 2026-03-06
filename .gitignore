@@ -1,0 +1,9 @@
+node_modules/
+projects/
+dist/
+src/.cache/
+.env
+.env.*
+*.log
+.cache/
+
