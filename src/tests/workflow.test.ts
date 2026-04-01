@@ -2311,51 +2311,63 @@ describe("forEach / as composer validation", () => {
     assert.equal(result.workflow.steps.length, 2);
   });
 
-  it("rejects forEach without as", () => {
-    assert.throws(
-      () =>
-        composeWorkflowDefinition({
-          name: "test_bad",
-          description: "Missing as",
-          params: { type: "object", properties: {} },
-          steps: [
-            {
-              id: "step1",
-              label: "Step",
-              config: {
-                type: "api_call",
-                operationId: "get-api-v1-test",
-                inputMapping: {},
-                forEach: "{{steps.x.result}}",
-              } as any,
-            },
-          ],
-        }),
-      /\"as\" is required when \"forEach\" is specified/,
-    );
+  it("auto-sets as when forEach is provided without it", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_auto_as",
+      description: "Auto as",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "list_channels",
+          label: "List channels",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels_list",
+            inputMapping: {},
+          },
+        },
+        {
+          id: "step1",
+          label: "Step",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-test",
+            inputMapping: {},
+            forEach: "{{steps.list_channels.result.channels}}",
+          } as any,
+          dependsOn: ["list_channels"],
+        },
+      ],
+    });
+    assert.ok(result.workflow);
+    assert.equal((result.workflow.steps[1].config as any).as, "step1_item");
+    assert.ok(result.warnings.some((w) => w.code === "FIELD_AUTO_SET"));
   });
 
-  it("rejects as without forEach", () => {
-    assert.throws(
-      () =>
-        composeWorkflowDefinition({
-          name: "test_bad",
-          description: "Missing forEach",
-          params: { type: "object", properties: {} },
-          steps: [
-            {
-              id: "step1",
-              label: "Step",
-              config: {
-                type: "api_call",
-                operationId: "get-api-v1-test",
-                inputMapping: {},
-                as: "item",
-              } as any,
-            },
-          ],
-        }),
-      /\"forEach\" is required when \"as\" is specified/,
+  it("strips as without forEach and emits warning", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_strip_as",
+      description: "Strip as",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "step1",
+          label: "Step",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-test",
+            inputMapping: {},
+            as: "item",
+          } as any,
+        },
+      ],
+    });
+    assert.ok(result.workflow);
+    assert.equal((result.workflow.steps[0].config as any).as, undefined);
+    assert.ok(
+      result.warnings.some(
+        (w) => w.code === "FIELD_STRIPPED" && w.stepId === "step1",
+      ),
     );
   });
 });
@@ -3109,6 +3121,94 @@ describe("codegen safety nets", () => {
     assert.ok(
       block.includes('"continueOnError": true'),
       "groups_create step should have continueOnError",
+    );
+  });
+
+  it("auto-sets continueOnError on channels_info with hardcoded roomName", () => {
+    const workflow: WorkflowDefinition = {
+      name: "test_room_lookup",
+      description: "Tests hardcoded roomName continueOnError",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "lookup_channel",
+          label: "Lookup Channel",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels_info",
+            inputMapping: { roomName: "support-team" },
+          },
+        },
+      ],
+      requiredEndpoints: ["get-api-v1-channels_info"],
+      usesSampling: false,
+      usesElicitation: false,
+    };
+    const code = generateWorkflowToolCode(workflow);
+    assert.ok(
+      code.includes('"continueOnError": true'),
+      "channels_info with hardcoded roomName should have continueOnError",
+    );
+  });
+
+  it("does NOT auto-set continueOnError when roomId is a template reference", () => {
+    const workflow: WorkflowDefinition = {
+      name: "test_dynamic_room",
+      description: "Tests dynamic roomId does not get continueOnError",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "lookup",
+          label: "Lookup",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels_info",
+            inputMapping: { roomName: "general" },
+          },
+        },
+        {
+          id: "invite",
+          label: "Invite",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-channels_invite",
+            inputMapping: {
+              roomId: "{{steps.lookup.result.channel._id}}",
+              userId: "{{params.userId}}",
+            },
+          },
+          dependsOn: ["lookup"],
+        },
+        {
+          id: "post_msg",
+          label: "Post",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat_postMessage",
+            inputMapping: {
+              roomId: "{{steps.lookup.result.channel._id}}",
+              text: "done",
+            },
+          },
+          dependsOn: ["invite"],
+        },
+      ],
+      requiredEndpoints: [
+        "get-api-v1-channels_info",
+        "post-api-v1-channels_invite",
+        "post-api-v1-chat_postMessage",
+      ],
+      usesSampling: false,
+      usesElicitation: false,
+    };
+    const code = generateWorkflowToolCode(workflow);
+    const inviteIdx = code.indexOf('"id": "invite"');
+    const nextIdx = code.indexOf('"id":', inviteIdx + 1);
+    const block =
+      nextIdx === -1 ? code.slice(inviteIdx) : code.slice(inviteIdx, nextIdx);
+    assert.ok(
+      !block.includes('"continueOnError"'),
+      "Mid-chain channels_invite with dynamic roomId should NOT have continueOnError from room-field rule",
     );
   });
 

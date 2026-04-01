@@ -613,21 +613,31 @@ export function formatEventShapesGuide(): string {
   );
 }
 
+function collectTemplatePaths(
+  obj: Record<string, unknown>,
+  prefix: string,
+): string[] {
+  const paths: string[] = [];
+  for (const [key, val] of Object.entries(obj)) {
+    const p = `${prefix}.${key}`;
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      paths.push(...collectTemplatePaths(val as Record<string, unknown>, p));
+    } else {
+      paths.push(`{{${p}}}`);
+    }
+  }
+  return paths;
+}
+
 export function getEventShapes(
   interfaceNames: string[],
-): Record<string, { param: string; shape: Record<string, unknown> }> {
-  const result: Record<
-    string,
-    { param: string; shape: Record<string, unknown> }
-  > = {};
+): Record<string, Record<string, unknown>> {
+  const result: Record<string, Record<string, unknown>> = {};
   for (const ifaceName of interfaceNames) {
     for (const entries of Object.values(APP_EVENTS)) {
       const found = entries.find((e) => e.name === ifaceName);
       if (found?.param && found.shapeKey && SHAPES[found.shapeKey]) {
-        result[ifaceName] = {
-          param: found.param,
-          shape: SHAPES[found.shapeKey],
-        };
+        result[ifaceName] = { [found.param]: SHAPES[found.shapeKey] };
         break;
       }
     }

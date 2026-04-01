@@ -282,8 +282,14 @@ function generateWorkflowCommandBody(workflow: WorkflowDefinition): string {
   lines.push(`            const stepResults: Record<string, any> = {};`);
   lines.push(`            const completedSteps: string[] = [];`);
   lines.push(``);
-  lines.push(`            // Parse slash command arguments as key=value pairs`);
-  lines.push(`            const params: Record<string, string> = {};`);
+  lines.push(`            // Parse slash command arguments`);
+  lines.push(`            const rawArgs = args.join(' ');`);
+  lines.push(`            const params: Record<string, any> = {`);
+  lines.push(`                roomId: room.id,`);
+  lines.push(`                senderId: sender.id,`);
+  lines.push(`                senderUsername: sender.username,`);
+  lines.push(`                query: rawArgs,`);
+  lines.push(`            };`);
   lines.push(`            for (const arg of args) {`);
   lines.push(`                const [key, ...rest] = arg.split('=');`);
   lines.push(
@@ -433,12 +439,13 @@ function generateBridgedCommandBody(workflow: WorkflowDefinition): string {
   lines.push(`                .setRoom(room);`);
   lines.push(`            await modify.getCreator().finish(statusMsg);`);
   lines.push(``);
-  lines.push(`            // Parse slash command arguments as key=value pairs`);
-  lines.push(`            const params: Record<string, string> = {};`);
+  lines.push(`            // Parse slash command arguments`);
+  lines.push(`            const rawArgs = args.join(' ');`);
+  lines.push(`            const kvParams: Record<string, string> = {};`);
   lines.push(`            for (const arg of args) {`);
   lines.push(`                const [key, ...rest] = arg.split('=');`);
   lines.push(
-    `                if (rest.length > 0) params[key] = rest.join('=');`,
+    `                if (rest.length > 0) kvParams[key] = rest.join('=');`,
   );
   lines.push(`            }`);
   lines.push(``);
@@ -448,7 +455,10 @@ function generateBridgedCommandBody(workflow: WorkflowDefinition): string {
     `            const result = await bridge.callTool('${esc(workflow.name)}', {`,
   );
   lines.push(`                roomId: room.id,`);
-  lines.push(`                ...params,`);
+  lines.push(`                senderId: sender.id,`);
+  lines.push(`                senderUsername: sender.username,`);
+  lines.push(`                query: rawArgs,`);
+  lines.push(`                ...kvParams,`);
   lines.push(`            });`);
   lines.push(``);
   lines.push(

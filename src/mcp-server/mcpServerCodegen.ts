@@ -175,6 +175,19 @@ export function generateWorkflowToolCode(workflow: WorkflowDefinition): string {
         ) {
           base.continueOnError = true;
         }
+        if (!base.continueOnError) {
+          const mapping = step.config.inputMapping as Record<string, unknown> | undefined;
+          if (mapping) {
+            const ROOM_FIELDS = ["roomName", "roomId", "channel"];
+            for (const field of ROOM_FIELDS) {
+              const val = mapping[field];
+              if (typeof val === "string" && val.length > 0 && !val.includes("{{")) {
+                base.continueOnError = true;
+                break;
+              }
+            }
+          }
+        }
         break;
       case "sampling":
         base.prompt = step.config.prompt;

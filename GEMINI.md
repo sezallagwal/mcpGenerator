@@ -101,12 +101,25 @@ You generate MCP servers for Rocket.Chat APIs. Tools: `get_capability_guide` →
 
 ### Event parameters
 
-Events wrap data under a domain key:
+Events wrap data under a **domain key** — ALWAYS include it:
 
 ```
-{{params.message.text}}       ✓    {{params.text}}               ✗
-{{params.message.sender.id}}  ✓    (apps-engine uses `id`, not `_id`)
+Message events (param = "message"):
+  {{params.message.text}}           ✓    {{params.text}}               ✗
+  {{params.message.sender.id}}      ✓    {{params.sender.id}}          ✗
+
+User events (param = "context"):
+  {{params.context.user.id}}        ✓    {{params.user.id}}            ✗
+  {{params.context.user.username}}  ✓    {{params.username}}           ✗
+  {{params.context.user.roles}}     ✓    {{params.roles}}              ✗
+  {{params.context.performedBy.username}} ✓
+
+Room events (param = "room"):
+  {{params.room.id}}                ✓    {{params.id}}                 ✗
+  {{params.room.displayName}}       ✓
 ```
+
+The `param` name from `get_endpoint_schemas` → `eventShapes` is the REQUIRED first segment after `params.`. Check the `templatePaths` array in the response — use those exact strings.
 
 Persistence state is top-level: `{{params.userState.x}}`
 

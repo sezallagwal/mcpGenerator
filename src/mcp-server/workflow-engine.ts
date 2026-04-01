@@ -254,6 +254,135 @@ async function executeApiCall(
   state.completedSteps.push(step.id);
 }
 
+const MONGO_ID_RE = /^[A-Za-z0-9]{17,24}$/;
+function looksLikeMongoId(v: string): boolean {
+  return MONGO_ID_RE.test(v);
+}
+
+const ROOM_ERROR_RE =
+  /error-room-not-found|error-invalid-room|error-channel-not-found|Channel not found|Room not found|not-found/i;
+
+function getMirrorPath(path: string): string | null {
+  if (path.includes("/channels."))
+    return path.replace("/channels.", "/groups.");
+  if (path.includes("/groups.")) return path.replace("/groups.", "/channels.");
+  return null;
+}
+
+async function resolveRoomId(
+  roomName: string,
+  client: any,
+): Promise<string | null> {
+  const encoded = encodeURIComponent(roomName);
+  try {
+    const info = await client.request(
+      "GET",
+      `/api/v1/channels.info?roomName=${encoded}`,
+      { auth: true },
+    );
+    const parsed = parseResult(info) as any;
+    if (parsed?.channel?._id) return parsed.channel._id;
+  } catch {}
+  try {
+    const info = await client.request(
+      "GET",
+      `/api/v1/groups.info?roomName=${encoded}`,
+      { auth: true },
+    );
+    const parsed = parseResult(info) as any;
+    if (parsed?.group?._id) return parsed.group._id;
+  } catch {}
+  return null;
+}
+
+async function resolveUserId(
+  username: string,
+  client: any,
+): Promise<string | null> {
+  try {
+    const info = await client.request(
+      "GET",
+      `/api/v1/users.info?username=${encodeURIComponent(username)}`,
+      { auth: true },
+    );
+    const parsed = parseResult(info) as any;
+    if (parsed?.user?._id) return parsed.user._id;
+  } catch {}
+  return null;
+}
+
+async function resolveUsername(
+  userId: string,
+  client: any,
+): Promise<string | null> {
+  try {
+    const info = await client.request(
+      "GET",
+      `/api/v1/users.info?userId=${encodeURIComponent(userId)}`,
+      { auth: true },
+    );
+    const parsed = parseResult(info) as any;
+    if (parsed?.user?.username) return parsed.user.username;
+  } catch {}
+  return null;
+}
+
+async function normalizePayload(
+  payload: Record<string, unknown>,
+  client: any,
+): Promise<void> {
+  if (typeof payload.name === "string") {
+    payload.name = payload.name
+      .toLowerCase()
+      .replace(/[^a-z0-9\-_.]/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .substring(0, 50);
+  }
+
+  for (const field of ["roomId", "rid"] as const) {
+    if (
+      typeof payload[field] === "string" &&
+      !looksLikeMongoId(payload[field] as string)
+    ) {
+      const val = payload[field] as string;
+      if (val === "GENERAL" || val.length === 0) continue;
+      const resolved = await resolveRoomId(val, client);
+      if (resolved) payload[field] = resolved;
+    }
+  }
+
+  if (
+    typeof payload.userId === "string" &&
+    !looksLikeMongoId(payload.userId as string)
+  ) {
+    const resolved = await resolveUserId(payload.userId as string, client);
+    if (resolved) payload.userId = resolved;
+  }
+
+  if (Array.isArray(payload.members)) {
+    const resolved: string[] = [];
+    for (const member of payload.members as string[]) {
+      if (typeof member === "string" && looksLikeMongoId(member)) {
+        const username = await resolveUsername(member, client);
+        resolved.push(username || member);
+      } else {
+        resolved.push(member as string);
+      }
+    }
+    const adminUser = process.env.ROCKETCHAT_USER;
+    if (adminUser && !resolved.includes(adminUser)) {
+      resolved.push(adminUser);
+    }
+    payload.members = resolved;
+  }
+
+  if (payload.channel === "@admin") {
+    const adminUser = process.env.ROCKETCHAT_USER;
+    if (adminUser) payload.channel = `@${adminUser}`;
+  }
+}
+
 async function executeSingleApiCall(
   step: StepDefinition,
   payload: Record<string, unknown>,
@@ -279,72 +408,7 @@ async function executeSingleApiCall(
     }
   }
 
-  if (
-    (ep?.path === "/api/v1/channels.create" ||
-      ep?.path === "/api/v1/groups.create") &&
-    typeof payload.name === "string"
-  ) {
-    payload.name = payload.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\-_.]/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "")
-      .substring(0, 50);
-  }
-
-  if (ep?.path === "/api/v1/channels.create") {
-    const adminUser = process.env.ROCKETCHAT_USER;
-    if (adminUser) {
-      const existing = Array.isArray(payload.members)
-        ? (payload.members as string[])
-        : [];
-      if (!existing.includes(adminUser)) {
-        payload.members = [...existing, adminUser];
-      }
-    }
-  }
-
-  if (ep?.path === "/api/v1/chat.postMessage" && payload.channel === "@admin") {
-    const adminUser = process.env.ROCKETCHAT_USER;
-    if (adminUser) {
-      payload.channel = `@${adminUser}`;
-    }
-  }
-
-  const RESOLVE_ROOMID_PATHS = new Set([
-    "/api/v1/channels.invite",
-    "/api/v1/channels.join",
-    "/api/v1/groups.invite",
-  ]);
-  if (
-    RESOLVE_ROOMID_PATHS.has(ep?.path) &&
-    typeof payload.roomId === "string"
-  ) {
-    const looksLikeMongoId = /^[A-Za-z0-9]{17,24}$/.test(payload.roomId);
-    if (!looksLikeMongoId) {
-      try {
-        if (ep.path.startsWith("/api/v1/channels.")) {
-          const info = await client.request(
-            "GET",
-            `/api/v1/channels.info?roomName=${encodeURIComponent(payload.roomId as string)}`,
-            { auth: true },
-          );
-          const parsed = parseResult(info) as any;
-          if (parsed?.channel?._id) payload.roomId = parsed.channel._id;
-        } else if (ep.path.startsWith("/api/v1/groups.")) {
-          const info = await client.request(
-            "GET",
-            `/api/v1/groups.info?roomName=${encodeURIComponent(payload.roomId as string)}`,
-            { auth: true },
-          );
-          const parsed = parseResult(info) as any;
-          if (parsed?.group?._id) payload.roomId = parsed.group._id;
-        }
-      } catch {
-        // Resolution failed — proceed with original roomId, let the API fail cleanly
-      }
-    }
-  }
+  await normalizePayload(payload, client);
 
   const result = await client.request(
     method,
@@ -372,26 +436,68 @@ async function executeSingleApiCall(
       errorText.includes("duplicate")
     ) {
       const name = payload.name as string;
+      const members = Array.isArray(payload.members)
+        ? (payload.members as string[])
+        : [];
       try {
-        if (ep?.path === "/api/v1/channels.create" && name) {
-          const info = await client.request(
-            "GET",
-            `/api/v1/channels.info?roomName=${encodeURIComponent(name)}`,
-            { auth: true },
-          );
-          if (!info.isError) return parseResult(info);
+        if (name) {
+          const roomId = await resolveRoomId(name, client);
+          if (roomId) {
+            const isGroup = ep?.path?.includes("groups.");
+            if (members.length > 0) {
+              const inviteEndpoint = isGroup
+                ? "/api/v1/groups.invite"
+                : "/api/v1/channels.invite";
+              for (const member of members) {
+                try {
+                  const body = looksLikeMongoId(member)
+                    ? { roomId, userId: member }
+                    : { roomId, username: member };
+                  await client.request("POST", inviteEndpoint, {
+                    auth: true,
+                    body,
+                  });
+                } catch {}
+              }
+            }
+            const infoEndpoint = isGroup
+              ? `/api/v1/groups.info?roomId=${encodeURIComponent(roomId)}`
+              : `/api/v1/channels.info?roomId=${encodeURIComponent(roomId)}`;
+            const info = await client.request("GET", infoEndpoint, {
+              auth: true,
+            });
+            if (!info.isError) return parseResult(info);
+          }
         }
-        if (ep?.path === "/api/v1/groups.create" && name) {
-          const info = await client.request(
-            "GET",
-            `/api/v1/groups.info?roomName=${encodeURIComponent(name)}`,
-            { auth: true },
-          );
-          if (!info.isError) return parseResult(info);
+      } catch {}
+    }
+
+    const mirrorPath = getMirrorPath(path);
+    if (mirrorPath && ROOM_ERROR_RE.test(errorText)) {
+      try {
+        const mirrorResult = await client.request(
+          method,
+          method === "GET"
+            ? mirrorPath +
+                "?" +
+                new URLSearchParams(
+                  Object.entries(payload).reduce(
+                    (a, [k, v]) => ({ ...a, [k]: String(v) }),
+                    {} as Record<string, string>,
+                  ),
+                ).toString()
+            : mirrorPath,
+          {
+            auth: true,
+            ...(method !== "GET" ? { body: payload } : {}),
+          },
+        );
+        if (!mirrorResult.isError) {
+          if (step.outputPath)
+            return extractPath(mirrorResult, step.outputPath);
+          return parseResult(mirrorResult);
         }
-      } catch {
-        // Fallback fetch failed — throw original error below
-      }
+      } catch {}
     }
 
     throw new Error(errorText);
@@ -662,20 +768,10 @@ async function executeSampling(
   const hasImageContent = step.content?.some((c) => c.type === "image");
   const jsonMode = step.responseFormat === "json" || detectJsonIntent(step);
 
-  if (!hasImageContent && isGeminiCliAvailable()) {
-    const prompt = buildFullPrompt(step, state);
-    text = await callGeminiCli(prompt, {
-      systemPrompt: step.systemPrompt,
-      maxTokens: step.maxTokens,
-      jsonMode,
-    });
-    usedPath = "cli";
-  }
-
   const hasApiKey = !!(
     process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY
   );
-  if (!usedPath && hasApiKey) {
+  if (hasApiKey) {
     const parts = await buildGeminiParts();
     text = await callGeminiDirect(parts, {
       systemPrompt: step.systemPrompt,
@@ -683,6 +779,16 @@ async function executeSampling(
       jsonMode,
     });
     usedPath = "direct";
+  }
+
+  if (!usedPath && !hasImageContent && isGeminiCliAvailable()) {
+    const prompt = buildFullPrompt(step, state);
+    text = await callGeminiCli(prompt, {
+      systemPrompt: step.systemPrompt,
+      maxTokens: step.maxTokens,
+      jsonMode,
+    });
+    usedPath = "cli";
   }
 
   if (!usedPath && server?.server?.createMessage) {

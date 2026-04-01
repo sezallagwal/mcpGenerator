@@ -6,4 +6,6 @@ src/.cache/
 .env.*
 *.log
 .cache/
+script.sh
+exp.sh
 

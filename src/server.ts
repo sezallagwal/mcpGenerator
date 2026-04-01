@@ -41,18 +41,46 @@ import {
   getEventShapes,
 } from "./capability-guide.js";
 
+function shapeToJsonSchema(
+  shape: Record<string, unknown>,
+): Record<string, unknown> {
+  const props: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(shape)) {
+    if (typeof val === "object" && val !== null && !Array.isArray(val)) {
+      props[key.replace(/\?$/, "")] = {
+        type: "object",
+        properties: shapeToJsonSchema(val as Record<string, unknown>),
+      };
+    } else {
+      props[key.replace(/\?$/, "")] = { type: "string" };
+    }
+  }
+  return props;
+}
+
 function deriveEventParamsSchema(
   eventInterfaceNames: string[],
   persistence?: { stateParam: string },
 ): Record<string, unknown> {
   const properties: Record<string, unknown> = {};
+  const shapes = getEventShapes(eventInterfaceNames);
   for (const ifaceName of eventInterfaceNames) {
     const paramName = getEventParamName(ifaceName);
     if (paramName && !properties[paramName]) {
-      properties[paramName] = {
-        type: "object",
-        description: `Event data from ${ifaceName}`,
-      };
+      const shapeEntry = shapes[ifaceName];
+      const shapeObj = shapeEntry?.[paramName];
+      if (shapeObj && typeof shapeObj === "object") {
+        properties[paramName] = {
+          type: "object",
+          description: `Event data from ${ifaceName}`,
+          properties: shapeToJsonSchema(shapeObj as Record<string, unknown>),
+        };
+      } else {
+        properties[paramName] = {
+          type: "object",
+          description: `Event data from ${ifaceName}`,
+        };
+      }
     }
   }
   if (persistence?.stateParam) {
@@ -106,7 +134,7 @@ server.registerTool(
       "This is the discovery tool — call it FIRST. " +
       "API entries show 'summary → operationId' — use operationIds in workflow steps. " +
       "App Events section lists realtime event interfaces — pick them for generate's eventInterfaces when the prompt describes a trigger ('when X happens'). " +
-      "After picking operationIds and eventInterfaces, call get_endpoint_schemas to get exact schemas BEFORE writing workflows.",
+      "After picking ALL needed operationIds and eventInterfaces, call get_endpoint_schemas ONCE with ALL of them in a single call BEFORE writing workflows.",
     inputSchema: {},
   },
   async () => {
@@ -139,6 +167,7 @@ server.registerTool(
     description:
       "Get exact request body schemas, response schemas, and event param shapes for chosen operationIds and eventInterfaces. " +
       "Call this AFTER get_capability_guide, BEFORE generate. " +
+      "IMPORTANT: Pass ALL operationIds you need in a SINGLE call — do NOT split across multiple calls. There is no limit on array size. " +
       "Returns the exact nested structure for each endpoint's request and response, " +
       "plus event param shapes so you can write inputMappings with exact field names. " +
       "Use the response schema to know the exact shape of step results (for {{steps.X.result.Y}} references).",
@@ -149,7 +178,13 @@ server.registerTool(
   },
   async ({ operationIds, eventInterfaces }) => {
     try {
-      const endpoints = await getFullEndpoints(operationIds, undefined, 2);
+      const mirrorIds = new Set<string>();
+      for (const id of operationIds) {
+        if (id.includes("channels")) mirrorIds.add(id.replace("channels", "groups"));
+        else if (id.includes("groups")) mirrorIds.add(id.replace("groups", "channels"));
+      }
+      const expandedIds = [...new Set([...operationIds, ...mirrorIds])];
+      const endpoints = await getFullEndpoints(expandedIds);
 
       const schemas: Record<string, Record<string, unknown>> = {};
       for (const ep of endpoints) {
@@ -157,13 +192,13 @@ server.registerTool(
           method: ep.method,
           path: ep.path,
         };
-        if (ep.requestBody?.schema) {
-          entry.requestBody = ep.requestBody.schema;
-        } else {
-          const props = (ep.inputSchema as Record<string, unknown>)?.properties;
-          if (props && Object.keys(props).length > 0) {
-            entry.queryParameters = ep.inputSchema;
-          }
+        const isProps = (ep.inputSchema as Record<string, unknown>)?.properties as
+          | Record<string, unknown>
+          | undefined;
+        if (isProps?.requestBody) {
+          entry.requestBody = isProps.requestBody;
+        } else if (isProps && Object.keys(isProps).length > 0) {
+          entry.queryParameters = ep.inputSchema;
         }
         if (ep.responseSchema) {
           entry.response = ep.responseSchema;
@@ -469,6 +504,41 @@ server.registerTool(
       }
 
       const epById = new Map(endpoints.map((ep) => [ep.operationId, ep]));
+
+      const CHANNEL_GROUP_PAIRS: Record<string, string> = {
+        "post-api-v1-channels_create": "post-api-v1-groups_create",
+        "post-api-v1-channels_invite": "post-api-v1-groups_invite",
+        "get-api-v1-channels_info":    "get-api-v1-groups_info",
+        "post-api-v1-channels_join":   "post-api-v1-groups_invite",
+        "post-api-v1-groups_create":   "post-api-v1-channels_create",
+        "post-api-v1-groups_invite":   "post-api-v1-channels_invite",
+        "get-api-v1-groups_info":      "get-api-v1-channels_info",
+      };
+
+      for (const wf of workflowDefs) {
+        for (const step of wf.steps) {
+          if (step.config.type !== "api_call") continue;
+          const cfg = step.config as { operationId: string; inputMapping?: Record<string, unknown> };
+          if (!cfg.inputMapping) continue;
+          const mapping = cfg.inputMapping;
+          const typeVal = typeof mapping.type === "string" ? mapping.type.toLowerCase() : "";
+          if (!typeVal) continue;
+
+          const isChannelOp = cfg.operationId.includes("channels_");
+          const isGroupOp = cfg.operationId.includes("groups_");
+          const wantsPrivate = typeVal === "p" || typeVal === "private";
+          const wantsPublic = typeVal === "c" || typeVal === "public";
+
+          if (isChannelOp && wantsPrivate && CHANNEL_GROUP_PAIRS[cfg.operationId]) {
+            cfg.operationId = CHANNEL_GROUP_PAIRS[cfg.operationId];
+            delete mapping.type;
+          } else if (isGroupOp && wantsPublic && CHANNEL_GROUP_PAIRS[cfg.operationId]) {
+            cfg.operationId = CHANNEL_GROUP_PAIRS[cfg.operationId];
+            delete mapping.type;
+          }
+        }
+      }
+
       const validationErrors: string[] = [];
       for (const wf of workflowDefs) {
         for (const step of wf.steps) {

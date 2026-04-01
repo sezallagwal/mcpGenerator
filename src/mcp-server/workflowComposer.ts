@@ -41,7 +41,9 @@ export interface ComposerWarning {
     | "TEMPLATE_AUTO_WRAPPED"
     | "AS_VAR_REWRITTEN"
     | "REQUEST_BODY_UNWRAPPED"
-    | "EVENT_PARAM_REWRITTEN";
+    | "EVENT_PARAM_REWRITTEN"
+    | "FIELD_STRIPPED"
+    | "FIELD_AUTO_SET";
   message: string;
 }
 
@@ -144,6 +146,32 @@ function detectCycles(steps: ComposeStepInput[]): void {
   }
 }
 
+function normalizeStepFields(steps: ComposeStepInput[]): ComposerWarning[] {
+  const warnings: ComposerWarning[] = [];
+  for (const step of steps) {
+    const cfg = step.config as unknown as Record<string, unknown>;
+    if (cfg.type === "api_call") {
+      if (cfg.as && !cfg.forEach) {
+        delete cfg.as;
+        warnings.push({
+          stepId: step.id,
+          code: "FIELD_STRIPPED",
+          message: `Stripped "as" from step "${step.id}" — "as" is only used with "forEach" for iteration. Step results are accessed via steps.${step.id}.result`,
+        });
+      }
+      if (cfg.forEach && !cfg.as) {
+        cfg.as = `${step.id}_item`;
+        warnings.push({
+          stepId: step.id,
+          code: "FIELD_AUTO_SET",
+          message: `Auto-set as="${cfg.as}" for step "${step.id}" — "as" names the loop variable in forEach iteration`,
+        });
+      }
+    }
+  }
+  return warnings;
+}
+
 function validateStepConfig(step: ComposeStepInput): void {
   const cfg = step.config;
   switch (cfg.type) {
@@ -151,16 +179,6 @@ function validateStepConfig(step: ComposeStepInput): void {
       if (!cfg.operationId) {
         throw new ComposerError(
           `Step "${step.id}" (api_call): operationId is required`,
-        );
-      }
-      if (cfg.forEach && !cfg.as) {
-        throw new ComposerError(
-          `Step "${step.id}" (api_call): "as" is required when "forEach" is specified`,
-        );
-      }
-      if (cfg.as && !cfg.forEach) {
-        throw new ComposerError(
-          `Step "${step.id}" (api_call): "forEach" is required when "as" is specified`,
         );
       }
       break;
@@ -1123,6 +1141,7 @@ export function composeWorkflowDefinition(
   }
 
   validateUniqueIds(steps);
+  const fieldNormWarnings = normalizeStepFields(steps);
   for (const step of steps) {
     validateStepConfig(step);
   }
@@ -1148,6 +1167,7 @@ export function composeWorkflowDefinition(
     : [];
 
   const allWarnings = [
+    ...fieldNormWarnings,
     ...eventParamWarnings,
     ...normalizationWarnings,
     ...implicitDepWarnings,

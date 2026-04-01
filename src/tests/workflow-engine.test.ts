@@ -972,9 +972,12 @@ describe("forEach / as iteration on api_call", () => {
     const calls: string[] = [];
     const mockClient = {
       request: async (_method: string, path: string, _opts: any) => {
-        const roomId = new URL("http://x" + path).searchParams.get("roomId");
-        calls.push(roomId!);
-        return { messages: [{ text: `msg-from-${roomId}` }] };
+        if (path.includes("chat.getPinnedMessages")) {
+          const roomId = new URL("http://x" + path).searchParams.get("roomId");
+          calls.push(roomId!);
+          return { messages: [{ text: `msg-from-${roomId}` }] };
+        }
+        return { isError: true, content: [{ text: "not found" }] };
       },
     };
 
