@@ -18,6 +18,7 @@ export interface SamplingStep {
   systemPrompt?: string;
   maxTokens?: number;
   responseFormat?: "text" | "json";
+  responseSchema?: Record<string, string>;
 }
 
 export interface ElicitationStep {
@@ -56,6 +57,8 @@ export interface WorkflowStep {
 export interface WorkflowDefinition {
   name: string;
   description: string;
+  triggerEvent?: string;
+  command?: string;
   params: JSONSchema7;
   steps: WorkflowStep[];
   requiredEndpoints: string[];

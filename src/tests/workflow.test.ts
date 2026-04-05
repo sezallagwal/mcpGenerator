@@ -1195,6 +1195,124 @@ describe("C3: Template Reference Validation", () => {
       /badField.*not in the workflow params schema/,
     );
   });
+
+  it("warns on invalid sub-field of object param", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_bad_subfield",
+      description: "Test invalid sub-field",
+      params: {
+        type: "object",
+        properties: {
+          room: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              type: { type: "string" },
+              displayName: { type: "string" },
+            },
+          },
+          query: { type: "string" },
+        },
+      },
+      steps: [
+        {
+          id: "send",
+          label: "Send",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat-sendmessage",
+            inputMapping: { roomId: "{{params.room.nonexistent}}" },
+          },
+        },
+      ],
+    });
+    assert.ok(
+      result.warnings.some((w) => w.code === "PARAM_SUBFIELD_UNKNOWN"),
+      "Should warn on unknown sub-field",
+    );
+    assert.ok(
+      result.warnings.some(
+        (w) =>
+          w.code === "PARAM_SUBFIELD_UNKNOWN" &&
+          w.message.includes("nonexistent") &&
+          w.message.includes("id, type, displayName"),
+      ),
+      "Warning should mention the invalid field and available fields",
+    );
+  });
+
+  it("allows valid nested param path", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_valid_subfield",
+      description: "Test valid nested path",
+      params: {
+        type: "object",
+        properties: {
+          room: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              type: { type: "string" },
+            },
+          },
+        },
+      },
+      steps: [
+        {
+          id: "send",
+          label: "Send",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat-sendmessage",
+            inputMapping: { roomId: "{{params.room.id}}" },
+          },
+        },
+      ],
+    });
+    assert.equal(
+      result.warnings.filter((w) => w.code === "PARAM_SUBFIELD_UNKNOWN").length,
+      0,
+      "Should not warn on valid nested param path",
+    );
+  });
+
+  it("allows JS methods on leaf params without warning", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_leaf_method",
+      description: "Test JS method on string param",
+      params: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+      },
+      steps: [
+        {
+          id: "send",
+          label: "Send",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat-sendmessage",
+            inputMapping: {},
+          },
+        },
+        {
+          id: "check",
+          label: "Check",
+          config: {
+            type: "conditional",
+            condition: 'params.query.includes("test")',
+            thenStep: "send",
+          },
+        },
+      ],
+    });
+    assert.equal(
+      result.warnings.filter((w) => w.code === "PARAM_SUBFIELD_UNKNOWN").length,
+      0,
+      "Should not warn on JS method calls on leaf params",
+    );
+  });
 });
 
 describe("C1: Data Flow Type Validation", () => {
@@ -2451,7 +2569,7 @@ describe("template normalization", () => {
     const mapping = (sendStep.config as any).inputMapping;
     assert.equal(
       mapping.rid,
-      "{{steps.fetch.result.channel._id}}",
+      "{{steps.fetch.channel._id}}",
       "Bare ref should be auto-wrapped",
     );
     assert.ok(
@@ -2518,12 +2636,12 @@ describe("template normalization", () => {
     const iterStep = result.workflow.steps.find((s) => s.id === "iter")!;
     assert.equal(
       (iterStep.config as any).forEach,
-      "{{steps.list.result.channels}}",
+      "{{steps.list.channels}}",
       "forEach bare ref should be auto-wrapped",
     );
   });
 
-  it("rewrites {{asVar.field}} to {{steps.asVar.result.field}}", () => {
+  it("rewrites {{asVar.field}} to {{steps.asVar.field}}", () => {
     const result = composeWorkflowDefinition({
       name: "test_as_rewrite",
       description: "Rewrite as-variable refs",
@@ -2555,12 +2673,74 @@ describe("template normalization", () => {
     const mapping = (iterStep.config as any).inputMapping;
     assert.equal(
       mapping.roomId,
-      "{{steps.channel.result._id}}",
+      "{{steps.channel._id}}",
       "as-variable ref should be rewritten",
     );
     assert.ok(
       result.warnings.some((w) => w.code === "AS_VAR_REWRITTEN"),
       "Should emit AS_VAR_REWRITTEN warning",
+    );
+  });
+
+  it("does NOT rewrite as-variable to params when names collide", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_as_collision",
+      description: "forEach as-var collides with param name",
+      params: {
+        type: "object",
+        properties: {
+          room: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              type: { type: "string" },
+            },
+          },
+          query: { type: "string" },
+        },
+      },
+      steps: [
+        {
+          id: "list",
+          label: "List",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels_list",
+            inputMapping: {},
+          },
+        },
+        {
+          id: "iter",
+          label: "Iterate rooms",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-chat_getPinnedMessages",
+            forEach: "{{steps.list.result.channels}}",
+            as: "room",
+            inputMapping: { roomId: "{{room._id}}" },
+          },
+          dependsOn: ["list"],
+        },
+      ],
+    });
+    const iterStep = result.workflow.steps.find((s) => s.id === "iter")!;
+    const mapping = (iterStep.config as any).inputMapping;
+    assert.notEqual(
+      mapping.roomId,
+      "{{params.room._id}}",
+      "as-variable 'room' must NOT be rewritten to params.room",
+    );
+    assert.equal(
+      mapping.roomId,
+      "{{steps.room._id}}",
+      "as-variable should be rewritten to steps.room path",
+    );
+    assert.ok(
+      !result.warnings.some(
+        (w) =>
+          w.code === "EVENT_PARAM_REWRITTEN" && w.message.includes('"room."'),
+      ),
+      "Should NOT emit EVENT_PARAM_REWRITTEN for forEach as-variable",
     );
   });
 
@@ -2593,8 +2773,8 @@ describe("template normalization", () => {
     const xStep = result.workflow.steps.find((s) => s.id === "transform")!;
     assert.equal(
       (xStep.config as any).expression,
-      "steps.fetch.result.channels.length",
-      "Transform expressions should remain as raw JS",
+      "steps.fetch.channels.length",
+      "Transform expressions should have .result auto-stripped",
     );
   });
 });
@@ -3336,6 +3516,661 @@ describe("codegen safety nets", () => {
     assert.ok(
       code.includes("steps.ensure_chan.result.channel._id"),
       "Existing template reference should be preserved",
+    );
+  });
+});
+
+// ── Phase 3: Sampling responseSchema inference ──────────────────────────
+
+describe("inferSamplingResponseSchemas", () => {
+  it("infers responseSchema from downstream field accesses", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_infer",
+      description: "Test schema inference",
+      params: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+      },
+      steps: [
+        {
+          id: "analyze",
+          label: "Analyze",
+          config: {
+            type: "sampling",
+            prompt:
+              "Analyze query: {{params.query}} — return relevant, answer, sources",
+            responseFormat: "json",
+          },
+        },
+        {
+          id: "check",
+          label: "Check",
+          config: {
+            type: "conditional",
+            condition: "steps.analyze.result.relevant === false",
+            thenStep: "fallback",
+            elseStep: "reply",
+          },
+          dependsOn: ["analyze"],
+        },
+        {
+          id: "reply",
+          label: "Reply",
+          config: {
+            type: "transform",
+            expression:
+              "steps.analyze.result.answer + steps.analyze.result.sources.join(',')",
+          },
+          dependsOn: ["check"],
+        },
+        {
+          id: "fallback",
+          label: "Fallback",
+          config: {
+            type: "transform",
+            expression: "'no results'",
+          },
+          dependsOn: ["check"],
+        },
+      ],
+    });
+
+    const analyzeStep = result.workflow.steps.find((s) => s.id === "analyze")!;
+    const cfg = analyzeStep.config as {
+      responseSchema?: Record<string, string>;
+    };
+    assert.ok(cfg.responseSchema, "responseSchema should be inferred");
+    assert.equal(
+      cfg.responseSchema!.relevant,
+      "boolean",
+      "relevant used with === false → boolean",
+    );
+    assert.equal(
+      cfg.responseSchema!.answer,
+      "string",
+      "answer used in string concatenation → string",
+    );
+    assert.equal(
+      cfg.responseSchema!.sources,
+      "array",
+      "sources used with .join → array",
+    );
+  });
+
+  it("emits SAMPLING_SCHEMA_MISMATCH when field not in prompt", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_mismatch",
+      description: "Test mismatch warning",
+      params: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+      },
+      steps: [
+        {
+          id: "analyze",
+          label: "Analyze",
+          config: {
+            type: "sampling",
+            prompt: "Analyze: {{params.query}}",
+            responseFormat: "json",
+          },
+        },
+        {
+          id: "use_it",
+          label: "Use",
+          config: {
+            type: "transform",
+            expression: "steps.analyze.result.secretField",
+          },
+          dependsOn: ["analyze"],
+        },
+      ],
+    });
+
+    const mismatchWarnings = result.warnings.filter(
+      (w) => w.code === "SAMPLING_SCHEMA_MISMATCH",
+    );
+    assert.ok(
+      mismatchWarnings.length > 0,
+      "should warn about secretField not in prompt",
+    );
+    assert.ok(
+      mismatchWarnings[0].message.includes("secretField"),
+      "warning mentions the missing field",
+    );
+  });
+
+  it("does NOT infer schema for sampling steps without responseFormat json", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_no_infer",
+      description: "No inference for text format",
+      params: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+      },
+      steps: [
+        {
+          id: "analyze",
+          label: "Analyze",
+          config: {
+            type: "sampling",
+            prompt: "Analyze: {{params.query}}",
+          },
+        },
+        {
+          id: "use_it",
+          label: "Use",
+          config: {
+            type: "transform",
+            expression: "steps.analyze.result.includes('hello')",
+          },
+          dependsOn: ["analyze"],
+        },
+      ],
+    });
+
+    const analyzeStep = result.workflow.steps.find((s) => s.id === "analyze")!;
+    const cfg = analyzeStep.config as {
+      responseSchema?: Record<string, string>;
+    };
+    assert.equal(
+      cfg.responseSchema,
+      undefined,
+      "no schema for text-format sampling",
+    );
+  });
+});
+
+// ── Fix B: config spread preserves all fields ─────────────────────────────
+
+describe("config spread (codegen)", () => {
+  it("preserves explicit responseFormat from sampling config", () => {
+    const workflow: WorkflowDefinition = {
+      name: "test_response_format",
+      description: "Test responseFormat preservation",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "analyze",
+          label: "Analyze",
+          config: {
+            type: "sampling",
+            prompt: "Tell me about the weather today",
+            responseFormat: "json",
+          },
+        },
+      ],
+      requiredEndpoints: [],
+      usesSampling: true,
+      usesElicitation: false,
+    };
+    const code = generateWorkflowToolCode(workflow);
+    assert.ok(
+      code.includes('"responseFormat": "json"'),
+      "responseFormat should appear in generated code",
+    );
+  });
+
+  it("preserves responseSchema in sampling config", () => {
+    const workflow: WorkflowDefinition = {
+      name: "test_response_schema",
+      description: "Test responseSchema preservation",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "analyze",
+          label: "Analyze",
+          config: {
+            type: "sampling",
+            prompt: "Analyze this message. Respond in JSON.",
+            responseFormat: "json",
+            responseSchema: { relevant: "boolean", answer: "string" },
+          },
+        },
+      ],
+      requiredEndpoints: [],
+      usesSampling: true,
+      usesElicitation: false,
+    };
+    const code = generateWorkflowToolCode(workflow);
+    assert.ok(
+      code.includes('"responseSchema"'),
+      "responseSchema should appear in generated code",
+    );
+    assert.ok(
+      code.includes('"relevant"'),
+      "responseSchema field should appear",
+    );
+  });
+
+  it("falls back to detection when responseFormat not explicit", () => {
+    const workflow: WorkflowDefinition = {
+      name: "test_detection_fallback",
+      description: "Test fallback detection",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "analyze",
+          label: "Analyze",
+          config: {
+            type: "sampling",
+            prompt:
+              "Respond with a JSON object containing relevant and answer fields",
+          },
+        },
+      ],
+      requiredEndpoints: [],
+      usesSampling: true,
+      usesElicitation: false,
+    };
+    const code = generateWorkflowToolCode(workflow);
+    assert.ok(
+      code.includes('"responseFormat": "json"'),
+      "responseFormat should be auto-detected from prompt",
+    );
+  });
+
+  it("does not add responseFormat when no JSON intent", () => {
+    const workflow: WorkflowDefinition = {
+      name: "test_no_json",
+      description: "Test no responseFormat",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "greet",
+          label: "Greet",
+          config: {
+            type: "sampling",
+            prompt: "Say hello to the user",
+          },
+        },
+      ],
+      requiredEndpoints: [],
+      usesSampling: true,
+      usesElicitation: false,
+    };
+    const code = generateWorkflowToolCode(workflow);
+    assert.ok(
+      !code.includes('"responseFormat"'),
+      "should NOT have responseFormat for non-JSON prompt",
+    );
+  });
+});
+
+// ── Fix C: Handlebars auto-conversion ────────────────────────────────────
+
+describe("Handlebars auto-conversion", () => {
+  it("converts {{#each}} to map/join", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_each",
+      description: "Test each conversion",
+      params: {
+        type: "object",
+        properties: { items: { type: "array" } },
+      },
+      steps: [
+        {
+          id: "format",
+          label: "Format",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat_sendMessage",
+            inputMapping: {
+              msg: "Results:\\n{{#each params.items}}- {{this.name}}\\n{{/each}}",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "format")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.ok(
+      !mapping.msg.includes("{{#each"),
+      "Handlebars should be converted",
+    );
+    assert.ok(mapping.msg.includes(".map("), "Should use .map()");
+    assert.ok(mapping.msg.includes(".join("), "Should use .join()");
+  });
+
+  it("converts {{#if}} to ternary", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_if",
+      description: "Test if conversion",
+      params: {
+        type: "object",
+        properties: { flag: { type: "boolean" } },
+      },
+      steps: [
+        {
+          id: "msg",
+          label: "Message",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat_sendMessage",
+            inputMapping: {
+              msg: "{{#if params.flag}}Enabled{{/if}}",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "msg")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.ok(
+      !mapping.msg.includes("{{#if"),
+      "Handlebars #if should be converted",
+    );
+    assert.ok(mapping.msg.includes("?"), "Should use ternary");
+  });
+
+  it("converts {{#if}}...{{else}}...{{/if}} to ternary with both branches", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_if_else",
+      description: "Test if-else conversion",
+      params: {
+        type: "object",
+        properties: { active: { type: "boolean" } },
+      },
+      steps: [
+        {
+          id: "status",
+          label: "Status",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat_sendMessage",
+            inputMapping: {
+              msg: "User is {{#if params.active}}active{{else}}inactive{{/if}}",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "status")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.ok(mapping.msg.includes("active"), "Should include 'active'");
+    assert.ok(mapping.msg.includes("inactive"), "Should include 'inactive'");
+    assert.ok(!mapping.msg.includes("{{#if"), "Handlebars should be converted");
+  });
+
+  it("throws on nested Handlebars blocks", () => {
+    assert.throws(
+      () => {
+        composeWorkflowDefinition({
+          name: "test_nested",
+          description: "Test nested blocks error",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "fmt",
+              label: "Format",
+              config: {
+                type: "api_call",
+                operationId: "post-api-v1-chat_sendMessage",
+                inputMapping: {
+                  msg: "{{#each items}}{{#if this.active}}{{this.name}}{{/if}}{{/each}}",
+                },
+              },
+            },
+          ],
+        });
+      },
+      { message: /nested Handlebars blocks/i },
+    );
+  });
+
+  it("throws on unsupported Handlebars helpers", () => {
+    assert.throws(
+      () => {
+        composeWorkflowDefinition({
+          name: "test_unless",
+          description: "Test unsupported helper",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "fmt",
+              label: "Format",
+              config: {
+                type: "api_call",
+                operationId: "post-api-v1-chat_sendMessage",
+                inputMapping: {
+                  msg: "{{#unless done}}Not done{{/unless}}",
+                },
+              },
+            },
+          ],
+        });
+      },
+      { message: /unsupported Handlebars helper/i },
+    );
+  });
+});
+
+// ── Fix A: .result auto-stripping ───────────────────────────────────────
+
+describe(".result auto-stripping", () => {
+  it("strips .result from template references", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_strip",
+      description: "Test result stripping",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "fetch",
+          label: "Fetch",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels_list",
+            inputMapping: {},
+          },
+        },
+        {
+          id: "send",
+          label: "Send",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat_sendMessage",
+            inputMapping: {
+              msg: "{{steps.fetch.result.channel.name}}",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "send")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.equal(mapping.msg, "{{steps.fetch.channel.name}}");
+    assert.ok(result.warnings.some((w) => w.code === "FIELD_STRIPPED"));
+  });
+
+  it("strips .result from transform expressions", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_strip_transform",
+      description: "Test result stripping in transforms",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "fetch",
+          label: "Fetch",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels_list",
+            inputMapping: {},
+          },
+        },
+        {
+          id: "calc",
+          label: "Calc",
+          config: {
+            type: "transform",
+            expression: "steps.fetch.result.items.length",
+          },
+          dependsOn: ["fetch"],
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "calc")!;
+    assert.equal((step.config as any).expression, "steps.fetch.items.length");
+  });
+
+  it("strips .result from conditional expressions", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_strip_cond",
+      description: "Test result stripping in conditionals",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "analyze",
+          label: "Analyze",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels_list",
+            inputMapping: {},
+          },
+        },
+        {
+          id: "check",
+          label: "Check",
+          config: {
+            type: "conditional",
+            condition: "steps.analyze.result.violated === true",
+            thenStep: "notify",
+          },
+          dependsOn: ["analyze"],
+        },
+        {
+          id: "notify",
+          label: "Notify",
+          config: {
+            type: "transform",
+            expression: "'notified'",
+          },
+          dependsOn: ["check"],
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "check")!;
+    assert.equal(
+      (step.config as any).condition,
+      "steps.analyze.violated === true",
+    );
+  });
+});
+
+describe("composeWorkflowDefinition — stringified JSON normalization", () => {
+  it("parses stringified JSON object in inputMapping back to native object", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_sort",
+      description: "Test sort normalization",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "list",
+          label: "List channels",
+          config: {
+            type: "api_call" as const,
+            operationId: "get-api-v1-channels_list",
+            inputMapping: {
+              sort: '{"msgs": -1}',
+              count: 10,
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "list")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.deepStrictEqual(mapping.sort, { msgs: -1 });
+    assert.equal(mapping.count, 10);
+    assert.ok(
+      result.warnings.some((w) => w.code === "STRINGIFIED_JSON_PARSED"),
+      "should emit STRINGIFIED_JSON_PARSED warning",
+    );
+  });
+
+  it("parses stringified JSON array in inputMapping", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_arr",
+      description: "Test array normalization",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "op",
+          label: "Op",
+          config: {
+            type: "api_call" as const,
+            operationId: "get-api-v1-channels_list",
+            inputMapping: {
+              fields: '["name", "msgs"]',
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "op")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.deepStrictEqual(mapping.fields, ["name", "msgs"]);
+  });
+
+  it("does NOT parse template strings that start with {{", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_tpl",
+      description: "Test template passthrough",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "op",
+          label: "Op",
+          config: {
+            type: "api_call" as const,
+            operationId: "get-api-v1-channels_list",
+            inputMapping: {
+              roomId: "{{params.roomId}}",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "op")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.equal(mapping.roomId, "{{params.roomId}}");
+    assert.ok(
+      !result.warnings.some((w) => w.code === "STRINGIFIED_JSON_PARSED"),
+      "should NOT emit STRINGIFIED_JSON_PARSED for template strings",
+    );
+  });
+
+  it("does NOT parse plain strings", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_plain",
+      description: "Test plain string passthrough",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "op",
+          label: "Op",
+          config: {
+            type: "api_call" as const,
+            operationId: "post-api-v1-chat_postMessage",
+            inputMapping: {
+              channel: "#general",
+              text: "hello world",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "op")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.equal(mapping.channel, "#general");
+    assert.equal(mapping.text, "hello world");
+    assert.ok(
+      !result.warnings.some((w) => w.code === "STRINGIFIED_JSON_PARSED"),
     );
   });
 });

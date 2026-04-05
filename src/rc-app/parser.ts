@@ -1,4 +1,4 @@
-import { Project, Node } from "ts-morph";
+import { Project, Type } from "ts-morph";
 import { createRequire } from "node:module";
 import { dirname, join, relative, sep } from "node:path";
 import { existsSync, readdirSync } from "node:fs";
@@ -10,6 +10,8 @@ import type {
 } from "./types.js";
 
 let cachedCapabilities: AppCapability[] | null = null;
+let cachedProject: Project | null = null;
+let cachedShapeMap: Record<string, Record<string, unknown>> = {};
 
 function resolveAppsEnginePath(): string {
   const require = createRequire(import.meta.url);
@@ -228,6 +230,21 @@ function simplifyType(typeText: string): string {
   return typeText.replace(/import\([^)]*\)\./g, "");
 }
 
+function addDtsRecursive(project: Project, dir: string): void {
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      addDtsRecursive(project, join(dir, entry.name));
+    } else if (entry.name.endsWith(".d.ts")) {
+      try {
+        project.addSourceFileAtPathIfExists(join(dir, entry.name));
+      } catch {
+        /* skip unreadable files */
+      }
+    }
+  }
+}
+
 export function parseAllCapabilities(): AppCapability[] {
   if (cachedCapabilities) return cachedCapabilities;
 
@@ -267,7 +284,11 @@ export function parseAllCapabilities(): AppCapability[] {
     }
   }
 
+  // Load all .d.ts files so the Project can resolve type shapes later
+  addDtsRecursive(project, defPath);
+
   cachedCapabilities = capabilities;
+  cachedProject = project;
   return capabilities;
 }
 
@@ -301,4 +322,120 @@ export function getCapabilitiesByCategory(category: string): AppCapability[] {
 
 export function clearCapabilityCache(): void {
   cachedCapabilities = null;
+  cachedProject = null;
+  cachedShapeMap = {};
+}
+
+function walkTypeShape(
+  type: Type,
+  visited: Set<string>,
+  depth: number,
+): Record<string, unknown> | string {
+  if (depth > 3) return "object";
+
+  const typeText = type.getText();
+  const typeName = type.getSymbol()?.getName() ?? typeText;
+
+  if (visited.has(typeName)) return "object";
+
+  if (type.isString() || type.isStringLiteral()) return "string";
+  if (type.isNumber() || type.isNumberLiteral()) return "number";
+  if (type.isBoolean() || type.isBooleanLiteral()) return "boolean";
+  if (typeText === "Date") return "string";
+  if (typeText === "any") return "any";
+
+  if (type.isArray()) {
+    return "array";
+  }
+
+  if (type.isUnion()) {
+    const types = type
+      .getUnionTypes()
+      .filter((t) => !t.isUndefined() && !t.isNull());
+    if (types.length === 1) return walkTypeShape(types[0], visited, depth);
+    if (types.every((t) => t.isStringLiteral() || t.isString()))
+      return "string";
+    if (types.every((t) => t.isNumberLiteral() || t.isNumber()))
+      return "number";
+    return "string";
+  }
+
+  const properties = type.getProperties();
+  if (properties.length === 0) return "object";
+
+  visited.add(typeName);
+  const shape: Record<string, unknown> = {};
+
+  for (const prop of properties) {
+    const propName = prop.getName();
+    if (propName.startsWith("_")) continue;
+
+    const declarations = prop.getDeclarations();
+    if (declarations.length === 0) continue;
+
+    const decl = declarations[0];
+    const propType = prop.getTypeAtLocation(decl);
+    const isOptional = (prop.getFlags() & 16777216) !== 0;
+    const key = isOptional ? `${propName}?` : propName;
+
+    const childShape = walkTypeShape(propType, new Set(visited), depth + 1);
+    shape[key] = childShape;
+  }
+
+  visited.delete(typeName);
+  return Object.keys(shape).length > 0 ? shape : "object";
+}
+
+function resolveShapeFromProject(
+  project: Project,
+  shapeKey: string,
+): Record<string, unknown> | null {
+  if (shapeKey in cachedShapeMap) return cachedShapeMap[shapeKey];
+
+  for (const sf of project.getSourceFiles()) {
+    const iface = sf.getInterface(shapeKey);
+    if (!iface) continue;
+
+    const shape = walkTypeShape(iface.getType(), new Set(), 0);
+    if (typeof shape === "object") {
+      cachedShapeMap[shapeKey] = shape;
+      return shape;
+    }
+    break;
+  }
+  return null;
+}
+
+export interface EventInfo {
+  param: string;
+  shapeKey: string;
+  shape: Record<string, unknown> | null;
+}
+
+export function resolveEventInfo(
+  interfaceNames: string[],
+): Record<string, EventInfo> {
+  // Ensure Project + capabilities are loaded
+  parseAllCapabilities();
+  if (!cachedProject) return {};
+
+  const caps = getCapabilities(interfaceNames);
+  const result: Record<string, EventInfo> = {};
+
+  for (const cap of caps) {
+    if (cap.methods.length === 0) continue;
+    const firstParam = cap.methods[0].parameters[0];
+    if (!firstParam) continue;
+
+    const shapeKey = firstParam.type;
+    const shape = resolveShapeFromProject(cachedProject, shapeKey);
+
+    result[cap.interfaceName] = {
+      param: firstParam.name,
+      shapeKey,
+      shape,
+    };
+  }
+
+  return result;
 }

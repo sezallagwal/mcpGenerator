@@ -180,15 +180,12 @@ ${messageHandler}}
 export function generateSlashCommandCode(
   cmd: SlashCommandDef,
   workflow?: WorkflowDefinition,
-  bridged?: boolean,
 ): string {
   const className = toPascalCase(cmd.command) + "Command";
 
   let handlerBody: string;
-  if (workflow && bridged) {
+  if (workflow) {
     handlerBody = generateBridgedCommandBody(workflow);
-  } else if (workflow) {
-    handlerBody = generateWorkflowCommandBody(workflow);
   } else {
     handlerBody = `
         const msg = modify.getCreator().startMessage()
@@ -196,10 +193,6 @@ export function generateSlashCommandCode(
             .setRoom(context.getRoom());
         await modify.getCreator().finish(msg);`;
   }
-
-  const extraImports = bridged
-    ? `import { McpBridge } from '../bridge/mcp-bridge';\n`
-    : "";
 
   return `/**
  * Slash Command: /${cmd.command}
@@ -219,7 +212,7 @@ import {
     SlashCommandContext,
 } from '@rocket.chat/apps-engine/definition/slashcommands';
 import { App } from '@rocket.chat/apps-engine/definition/App';
-${extraImports}
+import { McpBridge } from '../bridge/mcp-bridge';
 
 export class ${className} implements ISlashCommand {
     public command = '${esc(cmd.command)}';
@@ -251,8 +244,10 @@ export class ${className} implements ISlashCommand {
 ${handlerBody}
         } catch (error) {
             logger.error(\`/${esc(cmd.command)} failed:\`, error);
+            let errText = \`Error executing /${esc(cmd.command)}: \${error instanceof Error ? error.message : String(error)}\`;
+            if (errText.length > 2000) errText = errText.slice(0, 2000) + '\\n…(truncated)';
             const errMsg = modify.getCreator().startMessage()
-                .setText(\`Error executing /${esc(cmd.command)}: \${error instanceof Error ? error.message : String(error)}\`)
+                .setText(errText)
                 .setRoom(room);
             await modify.getCreator().finish(errMsg);
         }
@@ -261,183 +256,23 @@ ${handlerBody}
 `;
 }
 
-function generateWorkflowCommandBody(workflow: WorkflowDefinition): string {
-  const lines: string[] = [];
-
-  lines.push(`            // Workflow: ${esc(workflow.name)}`);
-  lines.push(
-    `            // Steps: ${workflow.steps.map((s) => s.id).join(" → ")}`,
-  );
-  lines.push(``);
-
-  lines.push(
-    `            const statusMsg = modify.getCreator().startMessage()`,
-  );
-  lines.push(
-    `                .setText('⏳ Running workflow: ${esc(workflow.name)}...')`,
-  );
-  lines.push(`                .setRoom(room);`);
-  lines.push(`            await modify.getCreator().finish(statusMsg);`);
-  lines.push(``);
-  lines.push(`            const stepResults: Record<string, any> = {};`);
-  lines.push(`            const completedSteps: string[] = [];`);
-  lines.push(``);
-  lines.push(`            // Parse slash command arguments`);
-  lines.push(`            const rawArgs = args.join(' ');`);
-  lines.push(`            const params: Record<string, any> = {`);
-  lines.push(`                roomId: room.id,`);
-  lines.push(`                senderId: sender.id,`);
-  lines.push(`                senderUsername: sender.username,`);
-  lines.push(`                query: rawArgs,`);
-  lines.push(`            };`);
-  lines.push(`            for (const arg of args) {`);
-  lines.push(`                const [key, ...rest] = arg.split('=');`);
-  lines.push(
-    `                if (rest.length > 0) params[key] = rest.join('=');`,
-  );
-  lines.push(`            }`);
-
-  for (const step of workflow.steps) {
-    lines.push(``);
-    lines.push(`            // Step: ${esc(step.label)} (${step.config.type})`);
-    lines.push(
-      `            logger.debug('[${esc(step.id)}] ${esc(step.label)}...');`,
-    );
-
-    switch (step.config.type) {
-      case "api_call": {
-        const cfg = step.config;
-        const methodMatch = cfg.operationId.match(/^(get|post|put|delete)-/);
-        const httpMethod = methodMatch ? methodMatch[1] : "get";
-        const apiPath = cfg.operationId
-          .replace(/^(get|post|put|delete)-api-v1-/, "")
-          .replace(/-/g, ".");
-        lines.push(
-          `            const ${step.id}_response = await http.${esc(httpMethod)}(\`\${await read.getEnvironmentReader().getServerSettings().getValueById('Site_Url')}/api/v1/${esc(apiPath)}\`, {`,
-        );
-        lines.push(`                headers: {`);
-        lines.push(`                    'Content-Type': 'application/json',`);
-        lines.push(`                },`);
-        lines.push(`            });`);
-        lines.push(
-          `            stepResults['${esc(step.id)}'] = { result: ${step.id}_response?.data, status: 'success' };`,
-        );
-        lines.push(`            completedSteps.push('${esc(step.id)}');`);
-        break;
-      }
-      case "transform": {
-        const cfg = step.config;
-        lines.push(
-          `            const ${step.id}_result = ((steps: any, p: any) => (${cfg.expression}))(stepResults, params);`,
-        );
-        lines.push(
-          `            stepResults['${esc(step.id)}'] = { result: ${step.id}_result, status: 'success' };`,
-        );
-        lines.push(`            completedSteps.push('${esc(step.id)}');`);
-        break;
-      }
-      case "sampling": {
-        lines.push(
-          `            // NOTE: Sampling (LLM analysis) is not natively available in RC Apps.`,
-        );
-        lines.push(
-          `            // To use AI, integrate with an external LLM API via http.post().`,
-        );
-        lines.push(
-          `            stepResults['${esc(step.id)}'] = { result: 'LLM analysis placeholder — integrate external AI API', status: 'skipped' };`,
-        );
-        lines.push(`            completedSteps.push('${esc(step.id)}');`);
-        break;
-      }
-      case "elicitation": {
-        lines.push(
-          `            // NOTE: Elicitation maps to user interaction via messages in RC Apps.`,
-        );
-        lines.push(
-          `            // For structured input, use Apps-Engine UI Kit (modals/action buttons).`,
-        );
-        lines.push(
-          `            stepResults['${esc(step.id)}'] = { result: 'User confirmation placeholder — use UI Kit for modals', status: 'skipped' };`,
-        );
-        lines.push(`            completedSteps.push('${esc(step.id)}');`);
-        break;
-      }
-      case "conditional": {
-        const cfg = step.config;
-        lines.push(
-          `            const ${step.id}_condition = ((steps: any, p: any) => !!(${cfg.condition}))(stepResults, params);`,
-        );
-        lines.push(
-          `            stepResults['${esc(step.id)}'] = { result: ${step.id}_condition, status: 'success' };`,
-        );
-        lines.push(`            completedSteps.push('${esc(step.id)}');`);
-        break;
-      }
-    }
-  }
-
-  lines.push(``);
-  lines.push(`            // Send results`);
-  lines.push(`            const resultText = [`);
-  lines.push(
-    `                '✅ Workflow "${esc(workflow.name)}" completed',`,
-  );
-  lines.push(
-    `                \`Steps completed: \${completedSteps.length}/${workflow.steps.length}\`,`,
-  );
-  lines.push(`                '',`);
-  lines.push(
-    `                ...completedSteps.map(s => \`  ✓ \${s}: \${JSON.stringify(stepResults[s]?.result ?? 'done').slice(0, 200)}\`),`,
-  );
-  lines.push(`            ].join('\\n');`);
-  lines.push(``);
-  lines.push(
-    `            const resultMsg = modify.getCreator().startMessage()`,
-  );
-  lines.push(`                .setText(resultText)`);
-  lines.push(`                .setRoom(room);`);
-  lines.push(`            await modify.getCreator().finish(resultMsg);`);
-
-  return lines.join("\n");
-}
-
 function generateBridgedCommandBody(workflow: WorkflowDefinition): string {
   const lines: string[] = [];
 
-  const EVENT_DOMAIN_PARAMS = new Set(["message", "room", "context"]);
-  const schemaProps = (workflow.params as any)?.properties ?? {};
-  const missingDomainParams = Object.keys(schemaProps).filter((k) =>
-    EVENT_DOMAIN_PARAMS.has(k),
+  // Detect if the workflow already sends messages via API (e.g. reply_in_thread)
+  const REPLY_OPS = new Set([
+    "post-api-v1-chat_sendMessage",
+    "post-api-v1-chat_postMessage",
+  ]);
+  const workflowSendsMessages = workflow.steps.some(
+    (s) =>
+      s.config.type === "api_call" &&
+      REPLY_OPS.has((s.config as any).operationId),
   );
-
-  if (missingDomainParams.length > 0) {
-    const paramList = missingDomainParams.map((p) => `\`${p}\``).join(", ");
-    lines.push(
-      `            // This workflow requires event data (${missingDomainParams.join(", ")}) that slash commands cannot provide.`,
-    );
-    lines.push(
-      `            const infoMsg = modify.getCreator().startMessage()`,
-    );
-    lines.push(
-      `                .setText('This workflow is event-driven and requires ${paramList} data that is only available when triggered by a Rocket.Chat event (e.g. a new message). It cannot be invoked via a slash command.')`,
-    );
-    lines.push(`                .setRoom(room);`);
-    lines.push(`            await modify.getCreator().finish(infoMsg);`);
-    return lines.join("\n");
-  }
 
   lines.push(
     `            // Workflow: ${esc(workflow.name)} (delegated to MCP Server)`,
   );
-  lines.push(``);
-  lines.push(
-    `            const statusMsg = modify.getCreator().startMessage()`,
-  );
-  lines.push(
-    `                .setText('⏳ Running workflow: ${esc(workflow.name)}...')`,
-  );
-  lines.push(`                .setRoom(room);`);
-  lines.push(`            await modify.getCreator().finish(statusMsg);`);
   lines.push(``);
   lines.push(`            // Parse slash command arguments`);
   lines.push(`            const rawArgs = args.join(' ');`);
@@ -449,38 +284,93 @@ function generateBridgedCommandBody(workflow: WorkflowDefinition): string {
   );
   lines.push(`            }`);
   lines.push(``);
+  lines.push(
+    `            const statusMsg = modify.getCreator().startMessage()`,
+  );
+  lines.push(
+    `                .setText(\`⏳ Running /${esc(workflow.command || workflow.name)} \${rawArgs}\`.trim())`,
+  );
+  lines.push(`                .setRoom(room);`);
+  lines.push(
+    `            const statusMsgId = await modify.getCreator().finish(statusMsg);`,
+  );
+  lines.push(``);
   lines.push(`            // Delegate to MCP Server via bridge`);
   lines.push(`            const bridge = new McpBridge(http, read);`);
+  lines.push(`            const toolArgs: Record<string, unknown> = {`);
   lines.push(
-    `            const result = await bridge.callTool('${esc(workflow.name)}', {`,
+    `                room: { id: room.id, type: room.type, displayName: room.displayName || room.slugifiedName },`,
   );
-  lines.push(`                roomId: room.id,`);
-  lines.push(`                senderId: sender.id,`);
-  lines.push(`                senderUsername: sender.username,`);
+  lines.push(
+    `                sender: { id: sender.id, username: sender.username, name: sender.name },`,
+  );
   lines.push(`                query: rawArgs,`);
   lines.push(`                ...kvParams,`);
-  lines.push(`            });`);
+  lines.push(`            };`);
+  lines.push(
+    `            // Use existing thread if run from one, otherwise thread under the status message`,
+  );
+  lines.push(`            const _threadId = context.getThreadId();`);
+  lines.push(`            toolArgs.threadId = _threadId || statusMsgId;`);
+  lines.push(`            const _triggerId = context.getTriggerId();`);
+  lines.push(`            if (_triggerId) toolArgs.triggerId = _triggerId;`);
+  lines.push(
+    `            const result = await bridge.callTool('${esc(workflow.name)}', toolArgs);`,
+  );
   lines.push(``);
-  lines.push(
-    `            if (result.status === 'success' && result.content) {`,
-  );
-  lines.push(
-    `                const resultMsg = modify.getCreator().startMessage()`,
-  );
-  lines.push(`                    .setText(result.content)`);
-  lines.push(`                    .setRoom(room);`);
-  lines.push(`                await modify.getCreator().finish(resultMsg);`);
-  lines.push(`            } else {`);
-  lines.push(
-    `                const errMsg = modify.getCreator().startMessage()`,
-  );
-  lines.push(
-    `                    .setText(\`Workflow failed: \${result.content || 'Unknown error'}\`)`,
-  );
-  lines.push(`                    .setRoom(room);`);
-  lines.push(`                await modify.getCreator().finish(errMsg);`);
-  lines.push(`            }`);
 
+  if (workflowSendsMessages) {
+    // Workflow has its own reply steps — only send a message on failure
+    lines.push(
+      `            // Workflow sends its own reply — only report errors`,
+    );
+    lines.push(`            if (result.status !== 'success') {`);
+    lines.push(
+      `                let errText = \`Workflow failed: \${result.content || 'Unknown error'}\`;`,
+    );
+    lines.push(
+      `                if (errText.length > 2000) errText = errText.slice(0, 2000) + '\\n…(truncated)';`,
+    );
+    lines.push(
+      `                const errMsg = modify.getCreator().startMessage()`,
+    );
+    lines.push(`                    .setText(errText)`);
+    lines.push(`                    .setRoom(room);`);
+    lines.push(`                await modify.getCreator().finish(errMsg);`);
+    lines.push(`            }`);
+  } else {
+    // Workflow has no reply steps — send the result as a message
+    lines.push(
+      `            if (result.status === 'success' && result.content) {`,
+    );
+    lines.push(
+      `                const text = typeof result.content === 'string' && result.content.length > 4000`,
+    );
+    lines.push(
+      `                    ? result.content.slice(0, 4000) + '\\n…(truncated)'`,
+    );
+    lines.push(`                    : result.content;`);
+    lines.push(
+      `                const resultMsg = modify.getCreator().startMessage()`,
+    );
+    lines.push(`                    .setText(text)`);
+    lines.push(`                    .setRoom(room);`);
+    lines.push(`                await modify.getCreator().finish(resultMsg);`);
+    lines.push(`            } else {`);
+    lines.push(
+      `                let errText = \`Workflow failed: \${result.content || 'Unknown error'}\`;`,
+    );
+    lines.push(
+      `                if (errText.length > 2000) errText = errText.slice(0, 2000) + '\\n…(truncated)';`,
+    );
+    lines.push(
+      `                const errMsg = modify.getCreator().startMessage()`,
+    );
+    lines.push(`                    .setText(errText)`);
+    lines.push(`                    .setRoom(room);`);
+    lines.push(`                await modify.getCreator().finish(errMsg);`);
+    lines.push(`            }`);
+  }
   return lines.join("\n");
 }
 
@@ -505,9 +395,10 @@ export function generateWebhookEndpointCode(ep: WebhookEndpointDef): string {
         // Example: Post a message to #general with the webhook data
         const room = await read.getRoomReader().getByName('general');
         if (room) {
-            const body = typeof data === 'object'
+            let body = typeof data === 'object'
                 ? Object.entries(data).map(([k, v]) => \`\${k}: \${v}\`).join('\\n')
                 : String(data);
+            if (body.length > 2000) body = body.slice(0, 2000) + '\\n…(truncated)';
 
             const msg = modify.getCreator().startMessage()
                 .setText(\`📥 Webhook received on /${esc(ep.path)}:\\n\${body}\`)
@@ -1547,4 +1438,3 @@ function deriveContextFields(typeName: string): {
   if (lower.includes("room")) return { room: "room", user: null };
   return { room: null, user: null };
 }
-

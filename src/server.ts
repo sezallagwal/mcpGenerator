@@ -32,14 +32,56 @@ import {
 import type { WorkflowDefinition } from "./mcp-server/types.js";
 import { injectEnsureChannelSteps } from "./mcp-server/ensureChannelInjector.js";
 import { generateRcAppProject } from "./rc-app/rcAppGenerator.js";
-import { getCapabilities } from "./rc-app/parser.js";
+import { getCapabilities, resolveEventInfo } from "./rc-app/parser.js";
 import { toPascalCase } from "./utils.js";
 import {
   formatCapabilityGuide,
   formatAppEventsGuide,
-  getEventParamName,
-  getEventShapes,
 } from "./capability-guide.js";
+
+const COMMAND_BRIDGE_PARAMS: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    room: {
+      type: "object",
+      description: "Room where the command was invoked",
+      properties: {
+        id: { type: "string", description: "Room ID" },
+        type: {
+          type: "string",
+          description:
+            "Room type: c (channel), p (private), d (DM), l (livechat)",
+        },
+        displayName: {
+          type: "string",
+          description: "Human-readable room name",
+        },
+      },
+    },
+    sender: {
+      type: "object",
+      description: "User who invoked the command",
+      properties: {
+        id: { type: "string", description: "User ID" },
+        username: { type: "string", description: "Username" },
+        name: { type: "string", description: "Display name" },
+      },
+    },
+    query: {
+      type: "string",
+      description: "Full argument string after /command",
+    },
+    threadId: {
+      type: "string",
+      description:
+        "Parent message ID if command was typed inside a thread (use as tmid for thread replies)",
+    },
+    triggerId: {
+      type: "string",
+      description: "UI trigger ID for interactive elements",
+    },
+  },
+};
 
 function shapeToJsonSchema(
   shape: Record<string, unknown>,
@@ -63,20 +105,18 @@ function deriveEventParamsSchema(
   persistence?: { stateParam: string },
 ): Record<string, unknown> {
   const properties: Record<string, unknown> = {};
-  const shapes = getEventShapes(eventInterfaceNames);
+  const infoMap = resolveEventInfo(eventInterfaceNames);
   for (const ifaceName of eventInterfaceNames) {
-    const paramName = getEventParamName(ifaceName);
-    if (paramName && !properties[paramName]) {
-      const shapeEntry = shapes[ifaceName];
-      const shapeObj = shapeEntry?.[paramName];
-      if (shapeObj && typeof shapeObj === "object") {
-        properties[paramName] = {
+    const info = infoMap[ifaceName];
+    if (info && !properties[info.param]) {
+      if (info.shape && typeof info.shape === "object") {
+        properties[info.param] = {
           type: "object",
           description: `Event data from ${ifaceName}`,
-          properties: shapeToJsonSchema(shapeObj as Record<string, unknown>),
+          properties: shapeToJsonSchema(info.shape),
         };
       } else {
-        properties[paramName] = {
+        properties[info.param] = {
           type: "object",
           description: `Event data from ${ifaceName}`,
         };
@@ -133,7 +173,7 @@ server.registerTool(
       "Returns ALL Rocket.Chat API endpoints (with operationIds) and App event interfaces in one guide. " +
       "This is the discovery tool — call it FIRST. " +
       "API entries show 'summary → operationId' — use operationIds in workflow steps. " +
-      "App Events section lists realtime event interfaces — pick them for generate's eventInterfaces when the prompt describes a trigger ('when X happens'). " +
+      "App Events section lists realtime event interfaces — use them as triggerEvent on individual workflows ('when X happens'). " +
       "After picking ALL needed operationIds and eventInterfaces, call get_endpoint_schemas ONCE with ALL of them in a single call BEFORE writing workflows.",
     inputSchema: {},
   },
@@ -165,12 +205,11 @@ server.registerTool(
   "get_endpoint_schemas",
   {
     description:
-      "Get exact request body schemas, response schemas, and event param shapes for chosen operationIds and eventInterfaces. " +
+      "Get exact request/response schemas and event param shapes for chosen operationIds and eventInterfaces. " +
       "Call this AFTER get_capability_guide, BEFORE generate. " +
       "IMPORTANT: Pass ALL operationIds you need in a SINGLE call — do NOT split across multiple calls. There is no limit on array size. " +
-      "Returns the exact nested structure for each endpoint's request and response, " +
-      "plus event param shapes so you can write inputMappings with exact field names. " +
-      "Use the response schema to know the exact shape of step results (for {{steps.X.result.Y}} references).",
+      "Returns request body schemas (exact field names for inputMapping) and response shape summaries (for {{steps.X.result.Y}} references). " +
+      "If you need both channels_* and groups_* variants, request both explicitly.",
     inputSchema: {
       operationIds: z.array(z.string()),
       eventInterfaces: z.array(z.string()).optional(),
@@ -178,13 +217,7 @@ server.registerTool(
   },
   async ({ operationIds, eventInterfaces }) => {
     try {
-      const mirrorIds = new Set<string>();
-      for (const id of operationIds) {
-        if (id.includes("channels")) mirrorIds.add(id.replace("channels", "groups"));
-        else if (id.includes("groups")) mirrorIds.add(id.replace("groups", "channels"));
-      }
-      const expandedIds = [...new Set([...operationIds, ...mirrorIds])];
-      const endpoints = await getFullEndpoints(expandedIds);
+      const endpoints = await getFullEndpoints(operationIds, undefined, 5);
 
       const schemas: Record<string, Record<string, unknown>> = {};
       for (const ep of endpoints) {
@@ -192,9 +225,8 @@ server.registerTool(
           method: ep.method,
           path: ep.path,
         };
-        const isProps = (ep.inputSchema as Record<string, unknown>)?.properties as
-          | Record<string, unknown>
-          | undefined;
+        const isProps = (ep.inputSchema as Record<string, unknown>)
+          ?.properties as Record<string, unknown> | undefined;
         if (isProps?.requestBody) {
           entry.requestBody = isProps.requestBody;
         } else if (isProps && Object.keys(isProps).length > 0) {
@@ -216,7 +248,15 @@ server.registerTool(
       }
 
       if (eventInterfaces && eventInterfaces.length > 0) {
-        result.eventShapes = getEventShapes(eventInterfaces);
+        const infoMap = resolveEventInfo(eventInterfaces);
+        const eventShapes: Record<string, Record<string, unknown>> = {};
+        for (const ifaceName of eventInterfaces) {
+          const info = infoMap[ifaceName];
+          if (info?.shape) {
+            eventShapes[ifaceName] = { [info.param]: info.shape };
+          }
+        }
+        result.eventShapes = eventShapes;
       }
 
       return {
@@ -247,9 +287,8 @@ server.registerTool(
     description:
       "Generate a complete linked project: an MCP Server (workflow tools) and optionally an RC App (realtime event handlers). " +
       "Each workflow becomes one tool that chains API calls, AI reasoning (sampling), and user confirmation (elicitation). " +
-      "If eventInterfaces are provided, an RC App is ALSO generated alongside, pre-wired via an HTTP bridge. " +
       "Output: a monorepo under projects/<projectName>/ with mcp-server/ (always) and rc-app/ (if events needed). " +
-      "Call ONCE with ALL workflows complete. See GEMINI.md for full schema and examples.",
+      "Call ONCE with ALL workflows complete.",
     inputSchema: {
       projectName: z.string(),
       description: z.string(),
@@ -257,6 +296,8 @@ server.registerTool(
         z.object({
           name: z.string(),
           description: z.string(),
+          triggerEvent: z.string().optional(),
+          command: z.string().optional(),
           params: z.record(z.string(), z.any()).optional(),
           steps: z.array(
             z.object({
@@ -271,7 +312,12 @@ server.registerTool(
               ]),
               dependsOn: z.array(z.string()).optional(),
               operationId: z.string().optional(),
-              inputMapping: z.record(z.string(), z.any()).optional(),
+              inputMapping: z
+                .record(z.string(), z.any())
+                .optional()
+                .describe(
+                  'Map of field→value. Values MUST be native JSON types (objects, arrays, numbers), NOT pre-stringified JSON strings. Example: {"sort": {"msgs": -1}}, NOT {"sort": "{\\"msgs\\": -1}"}.',
+                ),
               continueOnError: z.boolean().optional(),
               outputPath: z.string().optional(),
               forEach: z.string().optional(),
@@ -292,7 +338,7 @@ server.registerTool(
               model: z.enum(["user", "room", "misc"]),
               keyPath: z.string(),
               stateParam: z.string(),
-              defaultState: z.record(z.string(), z.any()),
+              defaultState: z.unknown(),
               updateFromStep: z.string().optional(),
             })
             .optional(),
@@ -308,15 +354,6 @@ server.registerTool(
           }),
         )
         .optional(),
-      extraCommands: z
-        .array(
-          z.object({
-            command: z.string(),
-            description: z.string(),
-            workflowName: z.string().optional(),
-          }),
-        )
-        .optional(),
     },
   },
   async ({
@@ -325,7 +362,6 @@ server.registerTool(
     workflows: rawWorkflows,
     eventInterfaces: eventInterfaceNames,
     webhookEndpoints,
-    extraCommands,
   }) => {
     try {
       if (!rawWorkflows || rawWorkflows.length === 0) {
@@ -340,7 +376,11 @@ server.registerTool(
         };
       }
 
-      const needsRcApp = eventInterfaceNames && eventInterfaceNames.length > 0;
+      const hasEventWorkflows = rawWorkflows.some((wf) => wf.triggerEvent);
+      const hasCommandWorkflows = rawWorkflows.some((wf) => !wf.triggerEvent);
+      const hasWebhooks = !!(webhookEndpoints && webhookEndpoints.length > 0);
+      const needsRcApp =
+        hasEventWorkflows || hasCommandWorkflows || hasWebhooks;
 
       const workflowDefs: WorkflowDefinition[] = [];
       const allComposerWarnings: string[] = [];
@@ -349,27 +389,33 @@ server.registerTool(
           let effectiveParams = raw.params as
             | Record<string, unknown>
             | undefined;
-          if (needsRcApp) {
+          if (raw.triggerEvent) {
             const derived = deriveEventParamsSchema(
-              eventInterfaceNames!,
+              [raw.triggerEvent],
               raw.persistence as { stateParam: string } | undefined,
             );
             if (raw.params && Object.keys(raw.params).length > 0) {
               allComposerWarnings.push(
-                `[${raw.name}] Workflow declared params schema was overridden with event-derived schema. ` +
+                `[${raw.name}] triggerEvent="${raw.triggerEvent}" — declared params replaced with event-derived schema. ` +
                   `Handler passes { ${Object.keys((derived as any).properties).join(", ")} }, not the declared schema.`,
               );
             }
             effectiveParams = derived;
+          } else {
+            if (raw.params && Object.keys(raw.params).length > 0) {
+              allComposerWarnings.push(
+                `[${raw.name}] command workflow — declared params replaced with command-bridge schema.`,
+              );
+            }
+            effectiveParams = COMMAND_BRIDGE_PARAMS;
           }
 
           const result = composeWorkflowDefinition({
             name: raw.name,
             description: raw.description,
-            params: (effectiveParams ?? {
-              type: "object",
-              properties: {},
-            }) as any,
+            triggerEvent: raw.triggerEvent,
+            command: raw.command,
+            params: effectiveParams as any,
             steps: (raw.steps as any[]).map((s: any) => {
               const { id, label, type, dependsOn, ...rest } = s;
               const config: Record<string, unknown> = { type };
@@ -508,20 +554,24 @@ server.registerTool(
       const CHANNEL_GROUP_PAIRS: Record<string, string> = {
         "post-api-v1-channels_create": "post-api-v1-groups_create",
         "post-api-v1-channels_invite": "post-api-v1-groups_invite",
-        "get-api-v1-channels_info":    "get-api-v1-groups_info",
-        "post-api-v1-channels_join":   "post-api-v1-groups_invite",
-        "post-api-v1-groups_create":   "post-api-v1-channels_create",
-        "post-api-v1-groups_invite":   "post-api-v1-channels_invite",
-        "get-api-v1-groups_info":      "get-api-v1-channels_info",
+        "get-api-v1-channels_info": "get-api-v1-groups_info",
+        "post-api-v1-channels_join": "post-api-v1-groups_invite",
+        "post-api-v1-groups_create": "post-api-v1-channels_create",
+        "post-api-v1-groups_invite": "post-api-v1-channels_invite",
+        "get-api-v1-groups_info": "get-api-v1-channels_info",
       };
 
       for (const wf of workflowDefs) {
         for (const step of wf.steps) {
           if (step.config.type !== "api_call") continue;
-          const cfg = step.config as { operationId: string; inputMapping?: Record<string, unknown> };
+          const cfg = step.config as {
+            operationId: string;
+            inputMapping?: Record<string, unknown>;
+          };
           if (!cfg.inputMapping) continue;
           const mapping = cfg.inputMapping;
-          const typeVal = typeof mapping.type === "string" ? mapping.type.toLowerCase() : "";
+          const typeVal =
+            typeof mapping.type === "string" ? mapping.type.toLowerCase() : "";
           if (!typeVal) continue;
 
           const isChannelOp = cfg.operationId.includes("channels_");
@@ -529,10 +579,18 @@ server.registerTool(
           const wantsPrivate = typeVal === "p" || typeVal === "private";
           const wantsPublic = typeVal === "c" || typeVal === "public";
 
-          if (isChannelOp && wantsPrivate && CHANNEL_GROUP_PAIRS[cfg.operationId]) {
+          if (
+            isChannelOp &&
+            wantsPrivate &&
+            CHANNEL_GROUP_PAIRS[cfg.operationId]
+          ) {
             cfg.operationId = CHANNEL_GROUP_PAIRS[cfg.operationId];
             delete mapping.type;
-          } else if (isGroupOp && wantsPublic && CHANNEL_GROUP_PAIRS[cfg.operationId]) {
+          } else if (
+            isGroupOp &&
+            wantsPublic &&
+            CHANNEL_GROUP_PAIRS[cfg.operationId]
+          ) {
             cfg.operationId = CHANNEL_GROUP_PAIRS[cfg.operationId];
             delete mapping.type;
           }
@@ -613,17 +671,17 @@ server.registerTool(
           serverName,
           workflowDefs,
           endpoints,
-          { bridged: !!needsRcApp },
+          { bridged: needsRcApp },
         ),
         "src/rc-client.ts": generateRestClientCode(),
         "package.json": generateMcpServerPackageJson(serverName),
         "tsconfig.json": generateMcpServerTsConfig(),
         ".env.example": generateMcpServerEnvExample({
-          bridged: !!needsRcApp,
+          bridged: needsRcApp,
           usesSampling: workflowDefs.some((w) => w.usesSampling),
         }),
         ".env": generateMcpServerEnvExample({
-          bridged: !!needsRcApp,
+          bridged: needsRcApp,
           usesSampling: workflowDefs.some((w) => w.usesSampling),
         }),
         "src/tests/setup.ts": generateTestSetupCode(
@@ -665,40 +723,72 @@ server.registerTool(
         | null = null;
 
       if (needsRcApp) {
-        const resolvedInterfaces =
-          eventInterfaceNames && eventInterfaceNames.length > 0
-            ? getCapabilities(eventInterfaceNames)
-            : [];
+        let resolvedInterfaces: import("./rc-app/types.js").AppCapability[] =
+          [];
+        let eventWorkflowMap: Record<string, string> = {};
 
-        if (eventInterfaceNames && eventInterfaceNames.length > 0) {
-          const found = new Set(resolvedInterfaces.map((c) => c.interfaceName));
-          const notFound = eventInterfaceNames.filter((n) => !found.has(n));
-          if (notFound.length > 0) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `Unknown event interfaces: ${notFound.join(", ")}.\nCheck the App Events section from get_capability_guide for available interfaces.`,
-                },
-              ],
-              isError: true,
-            };
+        if (hasEventWorkflows) {
+          const derivedEventInterfaces = workflowDefs
+            .filter((wf) => wf.triggerEvent)
+            .map((wf) => wf.triggerEvent!);
+          const effectiveEventInterfaces = [
+            ...new Set([
+              ...derivedEventInterfaces,
+              ...(eventInterfaceNames ?? []),
+            ]),
+          ];
+
+          if (eventInterfaceNames) {
+            const extraExplicit = eventInterfaceNames.filter(
+              (n) => !derivedEventInterfaces.includes(n),
+            );
+            for (const extra of extraExplicit) {
+              allComposerWarnings.push(
+                `eventInterfaces includes "${extra}" but no workflow has triggerEvent="${extra}" — included anyway.`,
+              );
+            }
+          }
+
+          resolvedInterfaces =
+            effectiveEventInterfaces.length > 0
+              ? getCapabilities(effectiveEventInterfaces)
+              : [];
+
+          if (effectiveEventInterfaces.length > 0) {
+            const found = new Set(
+              resolvedInterfaces.map((c) => c.interfaceName),
+            );
+            const notFound = effectiveEventInterfaces.filter(
+              (n) => !found.has(n),
+            );
+            if (notFound.length > 0) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Unknown event interfaces: ${notFound.join(", ")}.\nCheck the App Events section from get_capability_guide for available interfaces.`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+          }
+
+          for (const wf of workflowDefs) {
+            if (wf.triggerEvent) {
+              eventWorkflowMap[wf.triggerEvent] = wf.name;
+            }
+          }
+          const firstEventWorkflow = workflowDefs.find((wf) => wf.triggerEvent);
+          for (const iface of resolvedInterfaces) {
+            if (!eventWorkflowMap[iface.interfaceName] && firstEventWorkflow) {
+              eventWorkflowMap[iface.interfaceName] = firstEventWorkflow.name;
+              allComposerWarnings.push(
+                `Event ${iface.interfaceName} not claimed by any workflow triggerEvent — mapped to ${firstEventWorkflow.name}`,
+              );
+            }
           }
         }
-
-        const defaultToolName = workflowDefs[0].name;
-        const eventWorkflowMap: Record<string, string> = {};
-        for (const iface of resolvedInterfaces) {
-          eventWorkflowMap[iface.interfaceName] = defaultToolName;
-        }
-
-        const workflowNames = new Set(workflowDefs.map((wf) => wf.name));
-        const validExtraCommands = (extraCommands ?? []).filter((cmd) => {
-          if (/api[-_]v\d/i.test(cmd.command)) return false;
-          if (cmd.workflowName && !workflowNames.has(cmd.workflowName))
-            return false;
-          return true;
-        });
 
         rcAppResult = generateRcAppProject({
           appName: projectName,
@@ -706,33 +796,10 @@ server.registerTool(
           outputDir: projectDir,
           projectDirOverride: rcAppDir,
           workflows: workflowDefs,
-          extraCommands: validExtraCommands,
           webhookEndpoints,
           eventInterfaces: resolvedInterfaces,
           eventWorkflowMap,
         });
-      }
-
-      try {
-        console.error(`[npm] Installing mcp-server dependencies…`);
-        execSync("npm install --silent", { cwd: mcpServerDir, stdio: "pipe" });
-        console.error(`[npm] mcp-server dependencies installed.`);
-      } catch (err) {
-        console.error(
-          `[npm] mcp-server install failed: ${err instanceof Error ? err.message : err}`,
-        );
-      }
-
-      if (needsRcApp) {
-        try {
-          console.error(`[npm] Installing rc-app dependencies…`);
-          execSync("npm install --silent", { cwd: rcAppDir, stdio: "pipe" });
-          console.error(`[npm] rc-app dependencies installed.`);
-        } catch (err) {
-          console.error(
-            `[npm] rc-app install failed: ${err instanceof Error ? err.message : err}`,
-          );
-        }
       }
 
       let geminiLinked = false;
@@ -850,19 +917,9 @@ server.registerTool(
       summaryParts.push(
         ``,
         `Setup:`,
-        `  ✓ npm install already ran for mcp-server${rcAppResult ? " and rc-app" : ""}`,
-        `  Edit ${mcpServerDir}/.env with your Rocket.Chat credentials`,
-        `  # Then restart Gemini CLI — the MCP server will authenticate automatically`,
+        `  ✓ .env pre-populated from .env.example`,
+        `  Run \`npm install\` in mcp-server/${rcAppResult ? " and rc-app/" : ""}`,
       );
-
-      if (rcAppResult) {
-        summaryParts.push(
-          ``,
-          `  # Deploy the RC App`,
-          `  cd ${rcAppDir}`,
-          `  rc-apps deploy --url http://localhost:3000 -u admin -p admin`,
-        );
-      }
 
       if (allComposerWarnings.length > 0) {
         summaryParts.push(

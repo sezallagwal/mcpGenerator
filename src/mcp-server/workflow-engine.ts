@@ -16,6 +16,7 @@ export interface StepDefinition {
   systemPrompt?: string;
   maxTokens?: number;
   responseFormat?: "text" | "json";
+  responseSchema?: Record<string, string>;
   message?: string;
   requestedSchema?: Record<string, unknown>;
   onDecline?: "abort" | "skip_remaining";
@@ -53,24 +54,90 @@ function validateExpression(expr: string, context: string): void {
   }
 }
 
+const JS_RESERVED = new Set([
+  "break",
+  "case",
+  "catch",
+  "continue",
+  "debugger",
+  "default",
+  "delete",
+  "do",
+  "else",
+  "finally",
+  "for",
+  "function",
+  "if",
+  "in",
+  "instanceof",
+  "new",
+  "return",
+  "switch",
+  "this",
+  "throw",
+  "try",
+  "typeof",
+  "var",
+  "void",
+  "while",
+  "with",
+  "class",
+  "const",
+  "enum",
+  "export",
+  "extends",
+  "import",
+  "super",
+  "implements",
+  "interface",
+  "let",
+  "package",
+  "private",
+  "protected",
+  "public",
+  "static",
+  "yield",
+  "await",
+  "arguments",
+  "eval",
+]);
+
+function isValidParamName(name: string): boolean {
+  return /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name) && !JS_RESERVED.has(name);
+}
+
 export function resolveTemplate(
   template: string,
   params: Record<string, unknown>,
   steps: Record<string, unknown>,
+  locals: Record<string, unknown> = {},
 ): string {
   const cleaned = template
     .replace(/\{\{\[params\.([^\]]+)\]\}\}/g, "{{params.$1}}")
     .replace(/\{\{\[steps\.([^\]]+)\]\}\}/g, "{{steps.$1}}");
 
+  // Build scope: params properties (low priority), then locals (high priority)
+  // forEach locals shadow same-name params — that's always the correct behaviour
+  const scope = new Map<string, unknown>();
+  scope.set("params", params);
+  scope.set("steps", steps);
+  for (const [k, v] of Object.entries(params)) {
+    if (isValidParamName(k)) scope.set(k, v);
+  }
+  for (const [k, v] of Object.entries(locals)) {
+    if (isValidParamName(k)) scope.set(k, v);
+  }
+  const scopeNames = [...scope.keys()];
+  const scopeValues = [...scope.values()];
+
   return cleaned.replace(/\{\{([^}]+)\}\}/g, (_, expr: string) => {
     try {
       validateExpression(expr.trim(), "template");
       const fn = new Function(
-        "params",
-        "steps",
+        ...scopeNames,
         `"use strict"; return (${expr.trim()});`,
       );
-      const val = fn(params, steps);
+      const val = fn(...scopeValues);
       return typeof val === "object" && val !== null
         ? JSON.stringify(val)
         : String(val ?? "");
@@ -84,9 +151,10 @@ function resolveValue(
   value: unknown,
   params: Record<string, unknown>,
   steps: Record<string, unknown>,
+  locals: Record<string, unknown> = {},
 ): unknown {
   if (typeof value === "string" && value.includes("{{")) {
-    const result = resolveTemplate(value, params, steps);
+    const result = resolveTemplate(value, params, steps, locals);
     try {
       return JSON.parse(result);
     } catch {
@@ -94,10 +162,15 @@ function resolveValue(
     }
   }
   if (Array.isArray(value)) {
-    return value.map((el) => resolveValue(el, params, steps));
+    return value.map((el) => resolveValue(el, params, steps, locals));
   }
   if (typeof value === "object" && value !== null) {
-    return resolveMapping(value as Record<string, unknown>, params, steps);
+    return resolveMapping(
+      value as Record<string, unknown>,
+      params,
+      steps,
+      locals,
+    );
   }
   return value;
 }
@@ -106,10 +179,11 @@ export function resolveMapping(
   mapping: Record<string, unknown>,
   params: Record<string, unknown>,
   steps: Record<string, unknown>,
+  locals: Record<string, unknown> = {},
 ): Record<string, unknown> {
   const resolved: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(mapping)) {
-    resolved[key] = resolveValue(value, params, steps);
+    resolved[key] = resolveValue(value, params, steps, locals);
   }
   return resolved;
 }
@@ -167,17 +241,21 @@ export function parseResult(result: unknown): unknown {
 interface ExecutionState {
   params: Record<string, unknown>;
   stepResults: Record<string, any>;
+  stepStatus: Record<string, "success" | "skipped" | "error">;
+  stepErrors: Record<string, string>;
   completedSteps: string[];
   nextStepOverride: string | null;
   skipStep: string | null;
   stepDeps: Record<string, string[]>;
   deferredActions: DeferredAction[];
+  botUsernames: Set<string>;
 }
 
 export function shouldRun(stepId: string, state: ExecutionState): boolean {
   if (state.skipStep === stepId) {
     state.skipStep = null;
-    state.stepResults[stepId] = { result: null, status: "skipped" };
+    state.stepResults[stepId] = null;
+    state.stepStatus[stepId] = "skipped";
     return false;
   }
   if (state.nextStepOverride !== null) {
@@ -188,11 +266,74 @@ export function shouldRun(stepId: string, state: ExecutionState): boolean {
     return false;
   }
   const deps = state.stepDeps[stepId] || [];
-  if (deps.some((d) => state.stepResults[d]?.status === "skipped")) {
-    state.stepResults[stepId] = { result: null, status: "skipped" };
+  if (deps.some((d) => state.stepStatus[d] === "skipped")) {
+    state.stepResults[stepId] = null;
+    state.stepStatus[stepId] = "skipped";
     return false;
   }
   return deps.every((d) => state.completedSteps.includes(d));
+}
+
+// ── Bot message filtering ─────────────────────────────────────────────────
+// Search/read endpoints return { messages: [...] } where each message has
+// .u.username. To prevent the bot's own messages from polluting its own
+// search results (e.g. "⏳ Running /kb ..." appearing in chat_search), we
+// strip messages authored by any of the bot's known identities.
+const MESSAGE_READ_OPS =
+  /chat[._-](search|getPinnedMessages|getStarredMessages|getMentionedMessages|getThreadMessages)|channels[._-](history|messages)|groups[._-](history|messages)|im[._-](history|messages)/;
+
+export function filterBotMessages(
+  result: unknown,
+  botUsernames: Set<string>,
+): unknown {
+  if (!botUsernames.size || typeof result !== "object" || result === null)
+    return result;
+
+  const obj = result as Record<string, unknown>;
+  if (Array.isArray(obj.messages)) {
+    obj.messages = (obj.messages as Array<Record<string, any>>).filter(
+      (m) => !botUsernames.has(m?.u?.username),
+    );
+  }
+  return result;
+}
+
+export function shouldFilterBotMessages(
+  operationId: string | undefined,
+): boolean {
+  return !!operationId && MESSAGE_READ_OPS.test(operationId);
+}
+
+// ── Message size safety ───────────────────────────────────────────────────
+// RC's Message_MaxAllowedSize (default 5000) rejects oversized messages
+// with error-message-size-exceeded. Truncate msg/text fields before POSTing
+// to prevent cascading failures (error → huge error msg → also too big).
+const MSG_WRITE_OPS =
+  /chat[._-](sendMessage|postMessage|update)|channels[._-]setTopic|groups[._-]setTopic/;
+const RC_MSG_MAX = 4000;
+
+export function truncateMessageFields(
+  payload: Record<string, unknown>,
+  operationId: string | undefined,
+): void {
+  if (!operationId || !MSG_WRITE_OPS.test(operationId)) return;
+
+  // chat.sendMessage: { message: { msg } }
+  const message = payload.message as Record<string, unknown> | undefined;
+  if (
+    message &&
+    typeof message.msg === "string" &&
+    message.msg.length > RC_MSG_MAX
+  ) {
+    message.msg = message.msg.slice(0, RC_MSG_MAX) + "\n…(truncated)";
+  }
+  // chat.postMessage: { msg } or { text }
+  if (typeof payload.msg === "string" && payload.msg.length > RC_MSG_MAX) {
+    payload.msg = payload.msg.slice(0, RC_MSG_MAX) + "\n…(truncated)";
+  }
+  if (typeof payload.text === "string" && payload.text.length > RC_MSG_MAX) {
+    payload.text = payload.text.slice(0, RC_MSG_MAX) + "\n…(truncated)";
+  }
 }
 
 async function executeApiCall(
@@ -209,26 +350,38 @@ async function executeApiCall(
     const results: unknown[] = [];
 
     for (const item of collection) {
-      const augmentedSteps = {
-        ...state.stepResults,
-        [itemVar]: { result: item, status: "success" },
-      };
-      const args = resolveMapping(
-        step.inputMapping || {},
-        state.params,
-        augmentedSteps,
-      );
-      const result = await executeSingleApiCall(
-        step,
-        args as Record<string, unknown>,
-        state,
-        client,
-        endpoints,
-      );
-      results.push(result);
+      try {
+        const augmentedSteps = {
+          ...state.stepResults,
+          [itemVar]: item,
+        };
+        // Inject the forEach variable directly into scope so bare {{room._id}} works
+        const locals: Record<string, unknown> = { [itemVar]: item };
+        const args = resolveMapping(
+          step.inputMapping || {},
+          state.params,
+          augmentedSteps,
+          locals,
+        );
+        const result = await executeSingleApiCall(
+          step,
+          args as Record<string, unknown>,
+          state,
+          client,
+          endpoints,
+        );
+        results.push(result);
+      } catch (err) {
+        console.error(
+          `[forEach] ${step.id} iteration failed:`,
+          err instanceof Error ? err.message : err,
+        );
+        results.push(null);
+      }
     }
 
-    state.stepResults[step.id] = { result: results, status: "success" };
+    state.stepResults[step.id] = results;
+    state.stepStatus[step.id] = "success";
     state.completedSteps.push(step.id);
     return;
   }
@@ -243,14 +396,10 @@ async function executeApiCall(
     endpoints,
   );
 
-  if (step.outputPath) {
-    state.stepResults[step.id] = {
-      result: extractPath({ result } as any, step.outputPath),
-      status: "success",
-    };
-  } else {
-    state.stepResults[step.id] = { result, status: "success" };
-  }
+  // executeSingleApiCall already applies outputPath + parseResult,
+  // so just store the result directly — no double-extraction.
+  state.stepResults[step.id] = result;
+  state.stepStatus[step.id] = "success";
   state.completedSteps.push(step.id);
 }
 
@@ -261,6 +410,47 @@ function looksLikeMongoId(v: string): boolean {
 
 const ROOM_ERROR_RE =
   /error-room-not-found|error-invalid-room|error-channel-not-found|Channel not found|Room not found|not-found/i;
+
+const MSG_CHANNEL_ERROR_RE =
+  /error-not-allowed|not-authorized|error-room-not-found|error-invalid-room|Channel not found|Room not found|not-found/i;
+
+const MSG_POST_OPS = /chat[._-](postMessage|sendMessage)/;
+
+// ── Channel access helpers ────────────────────────────────────────────────
+// These handle the full lifecycle: create if needed → bot joins → invite members.
+// Used both by the channels_create duplicate handler and the message-posting
+// auto-recovery, so the logic is in one place.
+
+async function botJoinChannel(roomId: string, client: any): Promise<void> {
+  try {
+    await client.request("POST", "/api/v1/channels.join", {
+      auth: true,
+      body: { roomId },
+    });
+  } catch {
+    // Already a member or can't join — either way, continue
+  }
+}
+
+async function inviteMembers(
+  roomId: string,
+  members: string[],
+  isGroup: boolean,
+  client: any,
+): Promise<void> {
+  if (members.length === 0) return;
+  const inviteEndpoint = isGroup
+    ? "/api/v1/groups.invite"
+    : "/api/v1/channels.invite";
+  for (const member of members) {
+    try {
+      const body = looksLikeMongoId(member)
+        ? { roomId, userId: member }
+        : { roomId, username: member };
+      await client.request("POST", inviteEndpoint, { auth: true, body });
+    } catch {}
+  }
+}
 
 function getMirrorPath(path: string): string | null {
   if (path.includes("/channels."))
@@ -409,6 +599,18 @@ async function executeSingleApiCall(
   }
 
   await normalizePayload(payload, client);
+  truncateMessageFields(payload, step.operationId);
+
+  // Coerce stringified-JSON values back to objects so they serialize correctly
+  if (method === "GET") {
+    for (const [k, v] of Object.entries(payload)) {
+      if (typeof v === "string" && /^[\[{]/.test(v)) {
+        try {
+          payload[k] = JSON.parse(v);
+        } catch {}
+      }
+    }
+  }
 
   const result = await client.request(
     method,
@@ -417,7 +619,13 @@ async function executeSingleApiCall(
           "?" +
           new URLSearchParams(
             Object.entries(payload).reduce(
-              (a, [k, v]) => ({ ...a, [k]: String(v) }),
+              (a, [k, v]) => ({
+                ...a,
+                [k]:
+                  typeof v === "object" && v !== null
+                    ? JSON.stringify(v)
+                    : String(v ?? ""),
+              }),
               {} as Record<string, string>,
             ),
           ).toString()
@@ -444,22 +652,9 @@ async function executeSingleApiCall(
           const roomId = await resolveRoomId(name, client);
           if (roomId) {
             const isGroup = ep?.path?.includes("groups.");
-            if (members.length > 0) {
-              const inviteEndpoint = isGroup
-                ? "/api/v1/groups.invite"
-                : "/api/v1/channels.invite";
-              for (const member of members) {
-                try {
-                  const body = looksLikeMongoId(member)
-                    ? { roomId, userId: member }
-                    : { roomId, username: member };
-                  await client.request("POST", inviteEndpoint, {
-                    auth: true,
-                    body,
-                  });
-                } catch {}
-              }
-            }
+            // Bot must be a member to post later
+            await botJoinChannel(roomId, client);
+            await inviteMembers(roomId, members, !!isGroup, client);
             const infoEndpoint = isGroup
               ? `/api/v1/groups.info?roomId=${encodeURIComponent(roomId)}`
               : `/api/v1/channels.info?roomId=${encodeURIComponent(roomId)}`;
@@ -482,7 +677,13 @@ async function executeSingleApiCall(
                 "?" +
                 new URLSearchParams(
                   Object.entries(payload).reduce(
-                    (a, [k, v]) => ({ ...a, [k]: String(v) }),
+                    (a, [k, v]) => ({
+                      ...a,
+                      [k]:
+                        typeof v === "object" && v !== null
+                          ? JSON.stringify(v)
+                          : String(v ?? ""),
+                    }),
                     {} as Record<string, string>,
                   ),
                 ).toString()
@@ -493,20 +694,89 @@ async function executeSingleApiCall(
           },
         );
         if (!mirrorResult.isError) {
-          if (step.outputPath)
-            return extractPath(mirrorResult, step.outputPath);
-          return parseResult(mirrorResult);
+          const parsed = step.outputPath
+            ? extractPath(mirrorResult, step.outputPath)
+            : parseResult(mirrorResult);
+          if (
+            state.botUsernames.size &&
+            shouldFilterBotMessages(step.operationId)
+          )
+            filterBotMessages(parsed, state.botUsernames);
+          return parsed;
         }
       } catch {}
+    }
+
+    // ── Message-post auto-recovery ──────────────────────────────────────
+    // If chat.postMessage / chat.sendMessage fails because the bot isn't
+    // in the target channel, try to join (or create) it and retry once.
+    if (
+      step.operationId &&
+      MSG_POST_OPS.test(step.operationId) &&
+      MSG_CHANNEL_ERROR_RE.test(errorText)
+    ) {
+      // Resolve target channel from payload
+      const channel =
+        (payload.channel as string) ||
+        ((payload.message as any)?.rid as string) ||
+        "";
+      if (channel) {
+        try {
+          // channel could be "#name", "@user", or a roomId
+          const channelName = channel.startsWith("#")
+            ? channel.slice(1)
+            : channel.startsWith("@")
+              ? null
+              : null;
+          let roomId: string | null = null;
+
+          if (channelName) {
+            // Try to resolve by name
+            roomId = await resolveRoomId(channelName, client);
+            if (!roomId) {
+              // Channel doesn't exist — create it
+              try {
+                const createRes = await client.request(
+                  "POST",
+                  "/api/v1/channels.create",
+                  { auth: true, body: { name: channelName } },
+                );
+                const parsed = parseResult(createRes) as any;
+                roomId = parsed?.channel?._id || null;
+              } catch {}
+              if (!roomId) roomId = await resolveRoomId(channelName, client);
+            }
+          } else if (looksLikeMongoId(channel)) {
+            roomId = channel;
+          }
+
+          if (roomId) {
+            await botJoinChannel(roomId, client);
+            // Retry the original request
+            const retryResult = await client.request(method, path, {
+              auth: true,
+              ...(method !== "GET" ? { body: payload } : {}),
+            });
+            if (!retryResult.isError) {
+              const parsed = step.outputPath
+                ? extractPath(retryResult, step.outputPath)
+                : parseResult(retryResult);
+              return parsed;
+            }
+          }
+        } catch {}
+      }
     }
 
     throw new Error(errorText);
   }
 
-  if (step.outputPath) {
-    return extractPath(result, step.outputPath);
-  }
-  return parseResult(result);
+  const parsed = step.outputPath
+    ? extractPath(result, step.outputPath)
+    : parseResult(result);
+  if (state.botUsernames.size && shouldFilterBotMessages(step.operationId))
+    filterBotMessages(parsed, state.botUsernames);
+  return parsed;
 }
 
 async function callGeminiDirect(
@@ -667,13 +937,29 @@ async function callGeminiCli(
 }
 
 function buildFullPrompt(step: StepDefinition, state: ExecutionState): string {
+  let prompt: string;
   if (step.content && step.content.length > 0) {
-    return step.content
+    prompt = step.content
       .filter((c): c is { type: "text"; text: string } => c.type === "text")
       .map((c) => resolveTemplate(c.text, state.params, state.stepResults))
       .join("\n");
+  } else {
+    prompt = resolveTemplate(
+      step.prompt || "",
+      state.params,
+      state.stepResults,
+    );
   }
-  return resolveTemplate(step.prompt || "", state.params, state.stepResults);
+
+  // Auto-inject responseSchema into the prompt so the LLM knows the exact shape
+  if (step.responseSchema && Object.keys(step.responseSchema).length > 0) {
+    const fields = Object.entries(step.responseSchema)
+      .map(([name, type]) => `- ${name} (${type})`)
+      .join("\n");
+    prompt += `\n\nYou MUST respond with a JSON object containing exactly these fields:\n${fields}`;
+  }
+
+  return prompt;
 }
 
 async function executeSampling(
@@ -856,10 +1142,24 @@ async function executeSampling(
     }
   }
 
-  state.stepResults[step.id] = {
-    result: resultValue,
-    status: "success",
-  };
+  // Validate response shape against responseSchema if present
+  if (
+    step.responseSchema &&
+    typeof resultValue === "object" &&
+    resultValue !== null &&
+    !Array.isArray(resultValue)
+  ) {
+    for (const field of Object.keys(step.responseSchema)) {
+      if (!(field in (resultValue as Record<string, unknown>))) {
+        console.error(
+          `[sampling] ${step.id}: expected field "${field}" missing from AI response`,
+        );
+      }
+    }
+  }
+
+  state.stepResults[step.id] = resultValue;
+  state.stepStatus[step.id] = "success";
   state.completedSteps.push(step.id);
 }
 
@@ -898,7 +1198,8 @@ async function executeElicitation(
         ],
       };
     } else if (step.onDecline === "skip_remaining") {
-      state.stepResults[step.id] = { result: null, status: "skipped" };
+      state.stepResults[step.id] = null;
+      state.stepStatus[step.id] = "skipped";
       return {
         content: [
           {
@@ -919,10 +1220,8 @@ async function executeElicitation(
     }
   }
 
-  state.stepResults[step.id] = {
-    result: result.content,
-    status: "success",
-  };
+  state.stepResults[step.id] = result.content;
+  state.stepStatus[step.id] = "success";
   state.completedSteps.push(step.id);
   return null;
 }
@@ -938,10 +1237,8 @@ function executeTransform(step: StepDefinition, state: ExecutionState): void {
     fn = new Function("steps", "params", `"use strict"; ${withReturn}`);
   }
   const result = fn(state.stepResults, state.params);
-  state.stepResults[step.id] = {
-    result,
-    status: "success",
-  };
+  state.stepResults[step.id] = result;
+  state.stepStatus[step.id] = "success";
   state.completedSteps.push(step.id);
 }
 
@@ -1001,10 +1298,8 @@ function executeConditional(step: StepDefinition, state: ExecutionState): void {
     conditionResult = false;
   }
 
-  state.stepResults[step.id] = {
-    result: conditionResult,
-    status: "success",
-  };
+  state.stepResults[step.id] = conditionResult;
+  state.stepStatus[step.id] = "success";
 
   if (conditionResult) {
     if (step.elseStep) {
@@ -1025,6 +1320,7 @@ export interface WorkflowEngineOptions {
   endpoints: Record<string, EndpointInfo>;
   name: string;
   extra?: any;
+  botUsernames?: string[];
 }
 
 export async function runWorkflow(
@@ -1032,16 +1328,19 @@ export async function runWorkflow(
   steps: StepDefinition[],
   args: Record<string, unknown>,
 ): Promise<ToolResult> {
-  const { server, client, endpoints, name, extra } = options;
+  const { server, client, endpoints, name, extra, botUsernames } = options;
 
   const state: ExecutionState = {
     params: args,
     stepResults: {},
+    stepStatus: {},
+    stepErrors: {},
     completedSteps: [],
     nextStepOverride: null,
     skipStep: null,
     stepDeps: Object.fromEntries(steps.map((s) => [s.id, s.dependsOn || []])),
     deferredActions: [],
+    botUsernames: new Set(botUsernames ?? []),
   };
 
   const log = (msg: string) => console.error(`[${name}] ${msg}`);
@@ -1110,7 +1409,7 @@ export async function runWorkflow(
         const step = stepById.get(id)!;
         if (shouldRun(step.id, state)) {
           ready.push(step);
-        } else if (state.stepResults[step.id]?.status === "skipped") {
+        } else if (state.stepStatus[step.id] === "skipped") {
           log(`[${step.id}] SKIPPED (dependency skipped or branch not taken)`);
           remaining.delete(step.id);
         }
@@ -1118,8 +1417,9 @@ export async function runWorkflow(
 
       if (ready.length === 0) {
         for (const id of remaining) {
-          if (!state.stepResults[id]) {
-            state.stepResults[id] = { result: null, status: "skipped" };
+          if (!state.stepStatus[id]) {
+            state.stepResults[id] = null;
+            state.stepStatus[id] = "skipped";
           }
         }
         break;
@@ -1146,11 +1446,9 @@ export async function runWorkflow(
             const errMsg =
               stepErr instanceof Error ? stepErr.message : String(stepErr);
             log(`[${step.id}] ERROR (continuing): ${errMsg}`);
-            state.stepResults[step.id] = {
-              result: null,
-              status: "error",
-              error: errMsg,
-            };
+            state.stepResults[step.id] = null;
+            state.stepStatus[step.id] = "error";
+            state.stepErrors[step.id] = errMsg;
             state.completedSteps.push(step.id);
           } else {
             throw stepErr;
@@ -1181,11 +1479,9 @@ export async function runWorkflow(
                   ? result.reason.message
                   : String(result.reason);
               log(`[${step.id}] ERROR (continuing): ${errMsg}`);
-              state.stepResults[step.id] = {
-                result: null,
-                status: "error",
-                error: errMsg,
-              };
+              state.stepResults[step.id] = null;
+              state.stepStatus[step.id] = "error";
+              state.stepErrors[step.id] = errMsg;
               state.completedSteps.push(step.id);
             } else {
               throw result.reason;
@@ -1196,12 +1492,12 @@ export async function runWorkflow(
 
       for (const step of batch) {
         const sr = state.stepResults[step.id];
-        if (sr) {
+        if (sr !== undefined) {
           const preview =
-            typeof sr?.result === "string"
-              ? sr.result.substring(0, 200)
-              : JSON.stringify(sr?.result)?.substring(0, 200);
-          log(`[${step.id}] → ${sr?.status}: ${preview}`);
+            typeof sr === "string"
+              ? sr.substring(0, 200)
+              : JSON.stringify(sr)?.substring(0, 200);
+          log(`[${step.id}] → ${state.stepStatus[step.id]}: ${preview}`);
         }
       }
     }
@@ -1218,6 +1514,9 @@ export async function runWorkflow(
               status: "success",
               completedSteps: state.completedSteps,
               stepResults: state.stepResults,
+              ...(Object.keys(state.stepErrors).length > 0
+                ? { stepErrors: state.stepErrors }
+                : {}),
               ...(state.deferredActions.length > 0
                 ? { deferredActions: state.deferredActions }
                 : {}),
@@ -1241,6 +1540,9 @@ export async function runWorkflow(
               error: message,
               completedSteps: state.completedSteps,
               stepResults: state.stepResults,
+              ...(Object.keys(state.stepErrors).length > 0
+                ? { stepErrors: state.stepErrors }
+                : {}),
             },
             null,
             2,

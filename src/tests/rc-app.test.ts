@@ -202,15 +202,47 @@ describe("generateSlashCommandCode", () => {
     assert.ok(code.includes("class MyCommandCommand"));
   });
 
-  it("generates workflow execution code when workflow provided", () => {
+  it("generates bridged workflow command when workflow provided", () => {
     const code = generateSlashCommandCode(
       { command: "test", description: "Test", workflowName: "test_workflow" },
       testWorkflow,
     );
-    assert.ok(code.includes("stepResults"));
-    assert.ok(code.includes("completedSteps"));
-    assert.ok(code.includes("get_history"));
-    assert.ok(code.includes("format_result"));
+    assert.ok(code.includes("McpBridge"));
+    assert.ok(code.includes("bridge.callTool"));
+    assert.ok(code.includes("test_workflow"));
+  });
+
+  it("conditionally includes threadId and triggerId in bridge call", () => {
+    const code = generateSlashCommandCode(
+      { command: "test", description: "Test", workflowName: "test_workflow" },
+      testWorkflow,
+    );
+    assert.ok(
+      code.includes("const _threadId = context.getThreadId()"),
+      "Should extract threadId to a variable",
+    );
+    assert.ok(
+      code.includes("toolArgs.threadId = _threadId || statusMsgId"),
+      "Should use existing threadId or fall back to status message ID",
+    );
+    assert.ok(
+      code.includes(
+        "const statusMsgId = await modify.getCreator().finish(statusMsg)",
+      ),
+      "Should capture status message ID",
+    );
+    assert.ok(
+      code.includes("const _triggerId = context.getTriggerId()"),
+      "Should extract triggerId to a variable",
+    );
+    assert.ok(
+      code.includes("if (_triggerId) toolArgs.triggerId = _triggerId"),
+      "Should conditionally assign triggerId",
+    );
+    assert.ok(
+      !code.includes("threadId: context.getThreadId()"),
+      "Should NOT have inline threadId assignment",
+    );
   });
 
   it("includes error handling", () => {
@@ -503,7 +535,8 @@ describe("generateRcAppProject (full project)", () => {
         "utf-8",
       );
       assert.ok(cmdFile.includes("implements ISlashCommand"));
-      assert.ok(cmdFile.includes("get_history"));
+      assert.ok(cmdFile.includes("bridge.callTool"));
+      assert.ok(cmdFile.includes("test_workflow"));
     } finally {
       cleanup();
     }
@@ -574,11 +607,9 @@ describe("generateRcAppProject (full project)", () => {
         webhookEndpoints: [
           { path: "incoming", description: "Incoming hook", methods: ["post"] },
         ],
-        extraCommands: [{ command: "help", description: "Show help" }],
       });
 
       assert.ok(result.commands.includes("/test-workflow"));
-      assert.ok(result.commands.includes("/help"));
       assert.ok(result.webhooks.includes("/incoming"));
       assert.equal(result.workflowCount, 1);
       assert.ok(result.isBridged);
@@ -588,7 +619,6 @@ describe("generateRcAppProject (full project)", () => {
         "utf-8",
       );
       assert.ok(mainClass.includes("TestWorkflowCommand"));
-      assert.ok(mainClass.includes("HelpCommand"));
       assert.ok(mainClass.includes("IncomingEndpoint"));
       assert.ok(mainClass.includes("import { settings }"));
 
@@ -620,25 +650,16 @@ describe("generateRcAppProject (full project)", () => {
 });
 
 describe("workflow step types in RC App commands", () => {
-  it("generates API call step code", () => {
+  it("generates bridged API call delegation", () => {
     const code = generateSlashCommandCode(
       { command: "test", description: "Test", workflowName: "test_workflow" },
       testWorkflow,
     );
-    assert.ok(code.includes("http.get"));
-    assert.ok(code.includes("stepResults['get_history']"));
+    assert.ok(code.includes("bridge.callTool"));
+    assert.ok(code.includes("McpBridge"));
   });
 
-  it("generates transform step code", () => {
-    const code = generateSlashCommandCode(
-      { command: "test", description: "Test", workflowName: "test_workflow" },
-      testWorkflow,
-    );
-    assert.ok(code.includes("format_result"));
-    assert.ok(code.includes("steps.get_history"));
-  });
-
-  it("generates sampling step with placeholder", () => {
+  it("generates bridged command for sampling workflow", () => {
     const wf: WorkflowDefinition = {
       name: "sampling_test",
       description: "Test sampling",
@@ -667,11 +688,11 @@ describe("workflow step types in RC App commands", () => {
       },
       wf,
     );
-    assert.ok(code.includes("LLM analysis placeholder"));
-    assert.ok(code.includes("external AI API"));
+    assert.ok(code.includes("bridge.callTool"));
+    assert.ok(code.includes("sampling_test"));
   });
 
-  it("generates elicitation step with placeholder", () => {
+  it("generates bridged command for elicitation workflow", () => {
     const wf: WorkflowDefinition = {
       name: "elicit_test",
       description: "Test elicitation",
@@ -700,11 +721,11 @@ describe("workflow step types in RC App commands", () => {
       { command: "confirm", description: "Test", workflowName: "elicit_test" },
       wf,
     );
-    assert.ok(code.includes("User confirmation placeholder"));
-    assert.ok(code.includes("UI Kit"));
+    assert.ok(code.includes("bridge.callTool"));
+    assert.ok(code.includes("elicit_test"));
   });
 
-  it("generates conditional step code", () => {
+  it("generates bridged command for conditional workflow", () => {
     const wf: WorkflowDefinition = {
       name: "conditional_test",
       description: "Test conditional",
@@ -741,8 +762,8 @@ describe("workflow step types in RC App commands", () => {
       },
       wf,
     );
-    assert.ok(code.includes("check_condition"));
-    assert.ok(code.includes("params.enabled"));
+    assert.ok(code.includes("bridge.callTool"));
+    assert.ok(code.includes("conditional_test"));
   });
 });
 
@@ -1036,11 +1057,9 @@ describe("generateRcAppProject with eventInterfaces", () => {
         outputDir: dir,
         workflows: [testWorkflow],
         eventInterfaces: [mockPostRoomCreate],
-        extraCommands: [{ command: "status", description: "Show status" }],
       });
 
       assert.ok(result.commands.includes("/test-workflow"));
-      assert.ok(result.commands.includes("/status"));
       assert.deepStrictEqual(result.eventInterfaces, ["IPostRoomCreate"]);
 
       const mainClass = readFileSync(
@@ -1049,7 +1068,6 @@ describe("generateRcAppProject with eventInterfaces", () => {
       );
       assert.ok(mainClass.includes("implements IPostRoomCreate"));
       assert.ok(mainClass.includes("TestWorkflowCommand"));
-      assert.ok(mainClass.includes("StatusCommand"));
     } finally {
       cleanup();
     }
@@ -1520,6 +1538,7 @@ describe("Bug 2: event-bound workflow slash command filtering", () => {
   const eventWorkflow: WorkflowDefinition = {
     name: "analyze_and_moderate_message",
     description: "Analyze and moderate messages",
+    triggerEvent: "IPostMessageSent",
     params: {
       type: "object",
       properties: {
@@ -1617,7 +1636,7 @@ describe("Bug 2: event-bound workflow slash command filtering", () => {
     }
   });
 
-  it("generates graceful message for event-domain params in bridged command body", () => {
+  it("always generates bridged command body with McpBridge", () => {
     const code = generateSlashCommandCode(
       {
         command: "moderate",
@@ -1625,15 +1644,14 @@ describe("Bug 2: event-bound workflow slash command filtering", () => {
         workflowName: "analyze_and_moderate_message",
       },
       eventWorkflow,
-      true,
     );
     assert.ok(
-      code.includes("event-driven"),
-      "Should warn that workflow is event-driven",
+      code.includes("McpBridge"),
+      "Should always use McpBridge for bridged commands",
     );
     assert.ok(
-      !code.includes("bridge.callTool"),
-      "Should NOT attempt to call bridge for event-domain workflows",
+      code.includes("bridge.callTool"),
+      "Should delegate to MCP server via bridge",
     );
   });
 });

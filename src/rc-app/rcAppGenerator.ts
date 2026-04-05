@@ -30,7 +30,6 @@ export interface GenerateRcAppInput {
   description: string;
   outputDir: string;
   workflows?: WorkflowDefinition[];
-  extraCommands?: SlashCommandDef[];
   webhookEndpoints?: WebhookEndpointDef[];
   eventInterfaces?: AppCapability[];
   eventWorkflowMap?: Record<string, string>;
@@ -56,34 +55,19 @@ export function generateRcAppProject(
     description,
     outputDir,
     workflows = [],
-    extraCommands = [],
     webhookEndpoints = [],
     eventInterfaces = [],
     eventWorkflowMap = {},
   } = input;
 
-  const eventBoundWorkflows = new Set(Object.values(eventWorkflowMap));
-
-  const workflowCommands: SlashCommandDef[] = workflows
-    .filter((wf) => !eventBoundWorkflows.has(wf.name))
-    .map((wf) => ({
-      command: wf.name.replace(/_/g, "-"),
-      description: wf.description,
-      workflowName: wf.name,
-    }));
-
-  const fallbackWorkflow = workflows.find(
-    (wf) => !eventBoundWorkflows.has(wf.name),
-  );
-  const wiredExtraCommands: SlashCommandDef[] = extraCommands.map((cmd) => ({
-    ...cmd,
-    workflowName:
-      cmd.workflowName ??
-      fallbackWorkflow?.name ??
-      cmd.command.replace(/-/g, "_"),
+  const commandWorkflows = workflows.filter((wf) => !wf.triggerEvent);
+  const allCommands: SlashCommandDef[] = commandWorkflows.map((wf) => ({
+    command: wf.command ?? wf.name.replace(/_/g, "-"),
+    description: wf.description,
+    workflowName: wf.name,
   }));
 
-  const allCommands = [...workflowCommands, ...wiredExtraCommands];
+  const isBridged = eventInterfaces.length > 0 || allCommands.length > 0;
 
   const options: AppGenOptions = {
     appName,
@@ -92,7 +76,7 @@ export function generateRcAppProject(
     messageHandlers: false,
     webhookEndpoints,
     workflows,
-    bridged: eventInterfaces.length > 0,
+    bridged: isBridged,
   };
 
   const files: Record<string, string> = {};
@@ -140,13 +124,11 @@ export function generateRcAppProject(
 
   files["helpers/message.ts"] = generateMessageHelperCode();
 
-  const isBridged = eventInterfaces.length > 0;
   for (const cmd of allCommands) {
     const workflow = workflows.find((wf) => wf.name === cmd.workflowName);
     files[`commands/${cmd.command}.ts`] = generateSlashCommandCode(
       cmd,
       workflow,
-      isBridged,
     );
   }
 

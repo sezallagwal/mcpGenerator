@@ -8,6 +8,7 @@ import {
   generateTestSetupCode,
   generateMcpServerReadme,
 } from "../mcp-server/mcpServerTemplates.js";
+import { deriveRequiredPermissions } from "../mcp-server/mcpServerCodegen.js";
 import { getFullEndpoints } from "../mcp-server/parser/index.js";
 import type { FullEndpoint } from "../mcp-server/parser/types.js";
 
@@ -411,7 +412,10 @@ import { injectEnsureChannelSteps } from "../mcp-server/ensureChannelInjector.js
 import type { WorkflowDefinition, WorkflowStep } from "../mcp-server/types.js";
 import type { JSONSchema7 } from "json-schema";
 
-function makeWf(steps: WorkflowStep[], requiredEndpoints: string[] = []): WorkflowDefinition {
+function makeWf(
+  steps: WorkflowStep[],
+  requiredEndpoints: string[] = [],
+): WorkflowDefinition {
   return {
     name: "test_wf",
     description: "test",
@@ -423,7 +427,12 @@ function makeWf(steps: WorkflowStep[], requiredEndpoints: string[] = []): Workfl
   };
 }
 
-function apiStep(id: string, opId: string, inputMapping: Record<string, unknown>, dependsOn?: string[]): WorkflowStep {
+function apiStep(
+  id: string,
+  opId: string,
+  inputMapping: Record<string, unknown>,
+  dependsOn?: string[],
+): WorkflowStep {
   return {
     id,
     label: id,
@@ -435,15 +444,23 @@ function apiStep(id: string, opId: string, inputMapping: Record<string, unknown>
 describe("injectEnsureChannelSteps", () => {
   it("injects ensure step before a static #channel post", () => {
     const wf = makeWf([
-      apiStep("post_log", "post-api-v1-chat_postMessage", { channel: "#moderation-log", text: "hi" }),
+      apiStep("post_log", "post-api-v1-chat_postMessage", {
+        channel: "#moderation-log",
+        text: "hi",
+      }),
     ]);
     injectEnsureChannelSteps(wf);
     assert.equal(wf.steps.length, 2);
     assert.equal(wf.steps[0].id, "ensure_moderation_log");
     assert.equal(wf.steps[0].config.type, "api_call");
     if (wf.steps[0].config.type === "api_call") {
-      assert.equal(wf.steps[0].config.operationId, "post-api-v1-channels_create");
-      assert.deepEqual(wf.steps[0].config.inputMapping, { name: "moderation-log" });
+      assert.equal(
+        wf.steps[0].config.operationId,
+        "post-api-v1-channels_create",
+      );
+      assert.deepEqual(wf.steps[0].config.inputMapping, {
+        name: "moderation-log",
+      });
     }
     assert.ok(wf.steps[1].dependsOn?.includes("ensure_moderation_log"));
     assert.ok(wf.requiredEndpoints.includes("post-api-v1-channels_create"));
@@ -451,7 +468,10 @@ describe("injectEnsureChannelSteps", () => {
 
   it("does NOT inject for template channel references", () => {
     const wf = makeWf([
-      apiStep("post_reply", "post-api-v1-chat_postMessage", { channel: "{{params.channel}}", text: "hi" }),
+      apiStep("post_reply", "post-api-v1-chat_postMessage", {
+        channel: "{{params.channel}}",
+        text: "hi",
+      }),
     ]);
     injectEnsureChannelSteps(wf);
     assert.equal(wf.steps.length, 1, "should not inject for template channels");
@@ -459,7 +479,10 @@ describe("injectEnsureChannelSteps", () => {
 
   it("does NOT inject for non-hash channels", () => {
     const wf = makeWf([
-      apiStep("dm_user", "post-api-v1-chat_postMessage", { channel: "@someuser", text: "hi" }),
+      apiStep("dm_user", "post-api-v1-chat_postMessage", {
+        channel: "@someuser",
+        text: "hi",
+      }),
     ]);
     injectEnsureChannelSteps(wf);
     assert.equal(wf.steps.length, 1, "should not inject for DM channels");
@@ -467,8 +490,15 @@ describe("injectEnsureChannelSteps", () => {
 
   it("skips when Gemini already added ensure step", () => {
     const wf = makeWf([
-      apiStep("ensure_moderation_log", "post-api-v1-channels_create", { name: "moderation-log" }),
-      apiStep("post_log", "post-api-v1-chat_postMessage", { channel: "#moderation-log", text: "hi" }, ["ensure_moderation_log"]),
+      apiStep("ensure_moderation_log", "post-api-v1-channels_create", {
+        name: "moderation-log",
+      }),
+      apiStep(
+        "post_log",
+        "post-api-v1-chat_postMessage",
+        { channel: "#moderation-log", text: "hi" },
+        ["ensure_moderation_log"],
+      ),
     ]);
     injectEnsureChannelSteps(wf);
     assert.equal(wf.steps.length, 2, "should not duplicate ensure step");
@@ -476,8 +506,14 @@ describe("injectEnsureChannelSteps", () => {
 
   it("deduplicates when multiple steps post to the same channel", () => {
     const wf = makeWf([
-      apiStep("post_a", "post-api-v1-chat_postMessage", { channel: "#alerts", text: "a" }),
-      apiStep("post_b", "post-api-v1-chat_postMessage", { channel: "#alerts", text: "b" }),
+      apiStep("post_a", "post-api-v1-chat_postMessage", {
+        channel: "#alerts",
+        text: "a",
+      }),
+      apiStep("post_b", "post-api-v1-chat_postMessage", {
+        channel: "#alerts",
+        text: "b",
+      }),
     ]);
     injectEnsureChannelSteps(wf);
     assert.equal(wf.steps.length, 3, "should inject exactly one ensure step");
@@ -488,20 +524,39 @@ describe("injectEnsureChannelSteps", () => {
 
   it("handles multiple different channels", () => {
     const wf = makeWf([
-      apiStep("post_log", "post-api-v1-chat_postMessage", { channel: "#mod-log", text: "a" }),
-      apiStep("post_alert", "post-api-v1-chat_postMessage", { channel: "#admin-alerts", text: "b" }),
+      apiStep("post_log", "post-api-v1-chat_postMessage", {
+        channel: "#mod-log",
+        text: "a",
+      }),
+      apiStep("post_alert", "post-api-v1-chat_postMessage", {
+        channel: "#admin-alerts",
+        text: "b",
+      }),
     ]);
     injectEnsureChannelSteps(wf);
     assert.equal(wf.steps.length, 4);
-    const ensureIds = wf.steps.filter((s) => s.id.startsWith("ensure_")).map((s) => s.id);
-    assert.deepEqual(ensureIds.sort(), ["ensure_admin_alerts", "ensure_mod_log"]);
+    const ensureIds = wf.steps
+      .filter((s) => s.id.startsWith("ensure_"))
+      .map((s) => s.id);
+    assert.deepEqual(ensureIds.sort(), [
+      "ensure_admin_alerts",
+      "ensure_mod_log",
+    ]);
     assert.ok(wf.requiredEndpoints.includes("post-api-v1-channels_create"));
   });
 
   it("preserves existing dependsOn on the ensure step", () => {
     const wf = makeWf([
-      apiStep("check_msg", "post-api-v1-chat_postMessage", { channel: "#general", text: "x" }),
-      apiStep("post_log", "post-api-v1-chat_postMessage", { channel: "#mod-log", text: "y" }, ["check_msg"]),
+      apiStep("check_msg", "post-api-v1-chat_postMessage", {
+        channel: "#general",
+        text: "x",
+      }),
+      apiStep(
+        "post_log",
+        "post-api-v1-chat_postMessage",
+        { channel: "#mod-log", text: "y" },
+        ["check_msg"],
+      ),
     ]);
     injectEnsureChannelSteps(wf);
     const ensureMod = wf.steps.find((s) => s.id === "ensure_mod_log");
@@ -511,11 +566,18 @@ describe("injectEnsureChannelSteps", () => {
 
   it("does not add channels_create to requiredEndpoints if already present", () => {
     const wf = makeWf(
-      [apiStep("post_log", "post-api-v1-chat_postMessage", { channel: "#logs", text: "hi" })],
+      [
+        apiStep("post_log", "post-api-v1-chat_postMessage", {
+          channel: "#logs",
+          text: "hi",
+        }),
+      ],
       ["post-api-v1-channels_create"],
     );
     injectEnsureChannelSteps(wf);
-    const count = wf.requiredEndpoints.filter((e) => e === "post-api-v1-channels_create").length;
+    const count = wf.requiredEndpoints.filter(
+      (e) => e === "post-api-v1-channels_create",
+    ).length;
     assert.equal(count, 1, "should not duplicate requiredEndpoints entry");
   });
 
@@ -532,19 +594,219 @@ describe("injectEnsureChannelSteps", () => {
   });
 
   it("no-ops on workflow with no chat_postMessage steps", () => {
-    const wf = makeWf([
-      apiStep("get_users", "get-api-v1-users_list", {}),
-    ]);
+    const wf = makeWf([apiStep("get_users", "get-api-v1-users_list", {})]);
     injectEnsureChannelSteps(wf);
     assert.equal(wf.steps.length, 1);
   });
 
   it("skips when Gemini added channels_create with matching name but different step ID", () => {
     const wf = makeWf([
-      apiStep("ensure_moderation_log_channel", "post-api-v1-channels_create", { name: "moderation-log" }),
-      apiStep("log_it", "post-api-v1-chat_postMessage", { channel: "#moderation-log", text: "hi" }, ["ensure_moderation_log_channel"]),
+      apiStep("ensure_moderation_log_channel", "post-api-v1-channels_create", {
+        name: "moderation-log",
+      }),
+      apiStep(
+        "log_it",
+        "post-api-v1-chat_postMessage",
+        { channel: "#moderation-log", text: "hi" },
+        ["ensure_moderation_log_channel"],
+      ),
     ]);
     injectEnsureChannelSteps(wf);
-    assert.equal(wf.steps.length, 2, "should not duplicate when channels_create already targets the same channel");
+    assert.equal(
+      wf.steps.length,
+      2,
+      "should not duplicate when channels_create already targets the same channel",
+    );
+  });
+
+  it("includes members when postMessage step references params.sender", () => {
+    const wf = makeWf([
+      apiStep("post_help", "post-api-v1-chat_postMessage", {
+        channel: "#help",
+        text: '@{{params.sender.username}} asked: "{{params.query}}"',
+      }),
+    ]);
+    injectEnsureChannelSteps(wf);
+    assert.equal(wf.steps.length, 2);
+    const ensure = wf.steps[0];
+    assert.equal(ensure.id, "ensure_help");
+    if (ensure.config.type === "api_call") {
+      assert.deepEqual(ensure.config.inputMapping?.members, [
+        "{{params.sender.username}}",
+      ]);
+    }
+  });
+
+  it("does NOT include members when no step references params.sender", () => {
+    const wf = makeWf([
+      apiStep("post_alert", "post-api-v1-chat_postMessage", {
+        channel: "#alerts",
+        text: "System alert: something happened",
+      }),
+    ]);
+    injectEnsureChannelSteps(wf);
+    assert.equal(wf.steps.length, 2);
+    const ensure = wf.steps[0];
+    if (ensure.config.type === "api_call") {
+      assert.equal(
+        ensure.config.inputMapping?.members,
+        undefined,
+        "should not add members when sender is not referenced",
+      );
+    }
+  });
+});
+
+// ── Permission derivation (category-based) ────────────────────────────────
+
+describe("deriveRequiredPermissions", () => {
+  function makePermsWf(endpoints: string[]) {
+    return [
+      {
+        name: "test",
+        description: "test",
+        steps: [],
+        params: {},
+        requiredEndpoints: endpoints,
+        usesSampling: false,
+        usesElicitation: false,
+      },
+    ];
+  }
+
+  it("returns only base perms for empty workflow", () => {
+    const perms = deriveRequiredPermissions(makePermsWf([]));
+    assert.ok(perms.includes("create-personal-access-tokens"));
+    assert.ok(perms.includes("view-outside-room"));
+    assert.equal(perms.length, 2);
+  });
+
+  it("channels_list triggers full channel category", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["get-api-v1-channels_list"]),
+    );
+    assert.ok(perms.includes("create-c"), "should include create-c");
+    assert.ok(perms.includes("view-c-room"), "should include view-c-room");
+    assert.ok(
+      perms.includes("view-joined-room"),
+      "should include view-joined-room",
+    );
+    assert.ok(perms.includes("edit-room"), "should include edit-room");
+    assert.ok(perms.includes("archive-room"), "should include archive-room");
+  });
+
+  it("groups_create triggers full groups category", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["post-api-v1-groups_create"]),
+    );
+    assert.ok(perms.includes("create-p"));
+    assert.ok(perms.includes("view-p-room"));
+    assert.ok(perms.includes("edit-room"));
+  });
+
+  it("chat_postMessage triggers chat category", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["post-api-v1-chat_postMessage"]),
+    );
+    assert.ok(perms.includes("create-d"));
+    assert.ok(perms.includes("post-readonly"));
+  });
+
+  it("chat_delete triggers destructive chat perms", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["post-api-v1-chat_delete"]),
+    );
+    assert.ok(perms.includes("delete-message"));
+    assert.ok(perms.includes("edit-message"));
+    // also base chat perms
+    assert.ok(perms.includes("create-d"));
+  });
+
+  it("im_create triggers DM category", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["post-api-v1-im_create"]),
+    );
+    assert.ok(perms.includes("create-d"));
+    assert.ok(perms.includes("view-d-room"));
+    assert.ok(perms.includes("view-joined-room"));
+  });
+
+  it("users_info triggers users read perms", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["get-api-v1-users_info"]),
+    );
+    assert.ok(perms.includes("view-full-other-user-info"));
+  });
+
+  it("users_create triggers users admin perms", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["post-api-v1-users_create"]),
+    );
+    assert.ok(perms.includes("create-user"));
+    assert.ok(perms.includes("edit-other-user-info"));
+    assert.ok(perms.includes("edit-other-user-active-status"));
+    // also base users perm
+    assert.ok(perms.includes("view-full-other-user-info"));
+  });
+
+  it("rooms_muteUser triggers mute perm + room view perms", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["post-api-v1-rooms_muteUser"]),
+    );
+    assert.ok(perms.includes("mute-user"));
+    assert.ok(perms.includes("view-c-room"));
+    assert.ok(perms.includes("view-p-room"));
+  });
+
+  it("channels_invite triggers invite/kick perms", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["post-api-v1-channels_invite"]),
+    );
+    assert.ok(perms.includes("add-user-to-joined-room"));
+    assert.ok(perms.includes("add-user-to-any-c-room"));
+    assert.ok(perms.includes("remove-user"));
+  });
+
+  it("channels_delete triggers delete-c", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["post-api-v1-channels_delete"]),
+    );
+    assert.ok(perms.includes("delete-c"));
+  });
+
+  it("multiple endpoints produce union of all categories", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf([
+        "get-api-v1-channels_list",
+        "get-api-v1-chat_search",
+        "post-api-v1-users_create",
+      ]),
+    );
+    // channels
+    assert.ok(perms.includes("create-c"));
+    assert.ok(perms.includes("view-c-room"));
+    // chat
+    assert.ok(perms.includes("create-d"));
+    assert.ok(perms.includes("post-readonly"));
+    // users admin
+    assert.ok(perms.includes("create-user"));
+    assert.ok(perms.includes("edit-other-user-info"));
+    // base
+    assert.ok(perms.includes("create-personal-access-tokens"));
+    assert.ok(perms.includes("view-outside-room"));
+  });
+
+  it("emoji_custom triggers manage-emoji", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["post-api-v1-emoji-custom_create"]),
+    );
+    assert.ok(perms.includes("manage-emoji"));
+  });
+
+  it("discussions trigger start-discussion", () => {
+    const perms = deriveRequiredPermissions(
+      makePermsWf(["post-api-v1-rooms_getDiscussions"]),
+    );
+    assert.ok(perms.includes("start-discussion"));
   });
 });

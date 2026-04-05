@@ -1,4 +1,44 @@
 import type { CompactEndpoint } from "./mcp-server/parser/types.js";
+import { resolveEventInfo } from "./rc-app/parser.js";
+
+/** Inline hints appended to confusing endpoints: `Summary (hint) → operationId` */
+const ENDPOINT_ANNOTATIONS: Record<string, string> = {
+  // messaging — postMessage vs sendMessage
+  "post-api-v1-chat_postMessage": "resolves #channel and @user names",
+  "post-api-v1-chat_sendMessage": "needs rid; supports tmid for threads",
+  // messaging — search
+  "get-api-v1-chat_search":
+    "searches message text content by keyword in a room",
+  // messaging — DM history vs messages
+  "get-api-v1-im_history": "time-range filter: oldest/latest",
+  "get-api-v1-im_messages": "paginated; no time filter",
+  // messaging — discussions
+  "get-api-v1-chat_getDiscussions": "use rooms_getDiscussions instead",
+  // rooms — channel lists
+  "get-api-v1-channels_list": "all channels; sortable; full objects with _id",
+  "get-api-v1-channels_list_joined": "only user's joined channels",
+  // rooms — discussions
+  "get-api-v1-rooms_getDiscussions": "preferred over chat variant",
+  // rooms — history vs messages
+  "get-api-v1-channels_history": "time-range: oldest/latest params",
+  "get-api-v1-groups_history": "time-range; private groups",
+  "get-api-v1-channels_messages": "paginated; public channels",
+  "get-api-v1-groups_messages": "paginated; private groups",
+  // user-management
+  "post-api-v1-users_create": "admin-only",
+  "post-api-v1-users_register": "self-registration",
+  // statistics — engagement
+  "get-api-v1-engagement-dashboard-messages-top-five-popular-channels":
+    "max 5; no _id; analytics only",
+};
+
+/** Notes placed at the top of a domain section, before its endpoint entries. */
+const DOMAIN_NOTES: Record<string, string> = {
+  rooms:
+    "channels_* = public only. groups_* = private only. rooms_* = any type. Prefer rooms_* when type unknown.",
+};
+
+export { ENDPOINT_ANNOTATIONS, DOMAIN_NOTES };
 
 export function formatCapabilityGuide(endpoints: CompactEndpoint[]): string {
   if (endpoints.length === 0) {
@@ -20,8 +60,16 @@ export function formatCapabilityGuide(endpoints: CompactEndpoint[]): string {
 
   const sections: string[] = [];
   for (const [domain, entries] of byDomain) {
-    const items = [...entries].map(([summary, opId]) => `${summary} → ${opId}`);
-    sections.push(`## ${domain}\n${items.join(", ")}`);
+    const items = [...entries].map(([summary, opId]) => {
+      const hint = ENDPOINT_ANNOTATIONS[opId];
+      return hint ? `${summary} (${hint}) → ${opId}` : `${summary} → ${opId}`;
+    });
+    const note = DOMAIN_NOTES[domain];
+    sections.push(
+      note
+        ? `## ${domain}\n${note}\n${items.join(", ")}`
+        : `## ${domain}\n${items.join(", ")}`,
+    );
   }
 
   return (
@@ -34,522 +82,209 @@ export function formatCapabilityGuide(endpoints: CompactEndpoint[]): string {
 interface AppEventEntry {
   name: string;
   desc: string;
-  param?: string;
-  shapeKey?: string;
 }
-
-const SHAPES: Record<string, Record<string, unknown>> = {
-  IMessage: {
-    id: "string?",
-    text: "string?",
-    room: {
-      id: "string",
-      displayName: "string?",
-      slugifiedName: "string",
-      type: "string",
-    },
-    sender: {
-      id: "string",
-      username: "string",
-      name: "string",
-      roles: "string[]",
-    },
-    threadId: "string?",
-    emoji: "string?",
-    alias: "string?",
-    attachments: "array?",
-    customFields: "object?",
-    pinned: "boolean?",
-    type: "string?",
-  },
-  IRoom: {
-    id: "string",
-    displayName: "string?",
-    slugifiedName: "string",
-    type: "string",
-    creator: { id: "string", username: "string", name: "string" },
-    isDefault: "boolean?",
-    isReadOnly: "boolean?",
-    description: "string?",
-    customFields: "object?",
-  },
-  IRoomUserJoinedContext: {
-    joiningUser: {
-      id: "string",
-      username: "string",
-      name: "string",
-      roles: "string[]",
-    },
-    room: {
-      id: "string",
-      displayName: "string?",
-      slugifiedName: "string",
-      type: "string",
-    },
-    inviter: { id: "string?", username: "string?" },
-  },
-  IRoomUserLeaveContext: {
-    leavingUser: {
-      id: "string",
-      username: "string",
-      name: "string",
-      roles: "string[]",
-    },
-    room: {
-      id: "string",
-      displayName: "string?",
-      slugifiedName: "string",
-      type: "string",
-    },
-    removedBy: { id: "string?", username: "string?" },
-  },
-  IMessageReactionContext: {
-    reaction: "string",
-    isReacted: "boolean",
-    message: {
-      id: "string?",
-      text: "string?",
-      room: { id: "string", type: "string" },
-      sender: { id: "string", username: "string" },
-    },
-    user: { id: "string", username: "string" },
-  },
-  IMessageFollowContext: {
-    message: {
-      id: "string?",
-      text: "string?",
-      room: { id: "string", type: "string" },
-      sender: { id: "string", username: "string" },
-    },
-    user: { id: "string", username: "string" },
-    isFollowed: "boolean",
-  },
-  IMessagePinContext: {
-    message: {
-      id: "string?",
-      text: "string?",
-      room: { id: "string", type: "string" },
-      sender: { id: "string", username: "string" },
-    },
-    user: { id: "string", username: "string" },
-    isPinned: "boolean",
-  },
-  IMessageStarContext: {
-    message: {
-      id: "string?",
-      text: "string?",
-      room: { id: "string", type: "string" },
-      sender: { id: "string", username: "string" },
-    },
-    user: { id: "string", username: "string" },
-    isStarred: "boolean",
-  },
-  IMessageReportContext: {
-    message: {
-      id: "string?",
-      text: "string?",
-      room: { id: "string", type: "string" },
-      sender: { id: "string", username: "string" },
-    },
-    user: { id: "string", username: "string" },
-    reason: "string",
-  },
-  ILivechatRoom: {
-    id: "string",
-    displayName: "string?",
-    slugifiedName: "string",
-    type: "string",
-    visitor: {
-      id: "string?",
-      token: "string",
-      username: "string",
-      name: "string",
-    },
-    department: "string?",
-    servedBy: { id: "string?", username: "string?" },
-    isOpen: "boolean",
-    closedBy: { id: "string?", username: "string?" },
-  },
-  ILivechatEventContext: {
-    agent: { id: "string", username: "string", name: "string" },
-    room: {
-      id: "string",
-      displayName: "string?",
-      type: "string",
-      visitor: { token: "string", name: "string" },
-    },
-  },
-  ILivechatTransferEventContext: {
-    type: "string",
-    room: { id: "string", displayName: "string?", type: "string" },
-    from: { id: "string", username: "string" },
-    to: { id: "string", username: "string" },
-  },
-  IVisitor: {
-    id: "string?",
-    token: "string",
-    username: "string",
-    name: "string",
-    department: "string?",
-    phone: "string?",
-    visitorEmails: "array?",
-    customFields: "object?",
-  },
-  ILivechatDepartmentEventContext: {
-    department: {
-      id: "string",
-      name: "string?",
-      email: "string?",
-      description: "string?",
-    },
-  },
-  IUser: {
-    id: "string",
-    username: "string",
-    name: "string",
-    emails: "array",
-    type: "string",
-    isEnabled: "boolean",
-    roles: "string[]",
-    status: "string",
-    statusText: "string?",
-  },
-  IUserContext: {
-    user: {
-      id: "string",
-      username: "string",
-      name: "string",
-      roles: "string[]",
-      status: "string",
-    },
-    performedBy: { id: "string?", username: "string?" },
-  },
-  IUserStatusContext: {
-    user: { id: "string", username: "string", name: "string" },
-    currentStatus: "string",
-    previousStatus: "string",
-  },
-  IPreEmailSentContext: {
-    email: {
-      from: "string?",
-      to: "string?",
-      cc: "string?",
-      bcc: "string?",
-      replyTo: "string?",
-      subject: "string?",
-      text: "string?",
-      html: "string?",
-    },
-    context: "string",
-  },
-  IFileUploadContext: {
-    file: { name: "string", size: "number", type: "string" },
-    content: "any",
-  },
-  IExternalComponent: {
-    appId: "string",
-    name: "string",
-    description: "string",
-    icon: "string?",
-    url: "string?",
-  },
-};
 
 const APP_EVENTS: Record<string, AppEventEntry[]> = {
   messages: [
     {
       name: "IPostMessageSent",
       desc: "after message sent",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPostMessageSentToBot",
       desc: "DM sent to bot",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPostMessageDeleted",
       desc: "after message deleted",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPostMessageUpdated",
       desc: "after message updated",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPostMessageReacted",
       desc: "reaction added/removed",
-      param: "context",
-      shapeKey: "IMessageReactionContext",
     },
     {
       name: "IPostMessageFollowed",
       desc: "message followed/unfollowed",
-      param: "context",
-      shapeKey: "IMessageFollowContext",
     },
     {
       name: "IPostMessagePinned",
       desc: "message pinned/unpinned",
-      param: "context",
-      shapeKey: "IMessagePinContext",
     },
     {
       name: "IPostMessageStarred",
       desc: "message starred/unstarred",
-      param: "context",
-      shapeKey: "IMessageStarContext",
     },
     {
       name: "IPostMessageReported",
       desc: "message reported",
-      param: "context",
-      shapeKey: "IMessageReportContext",
     },
     {
       name: "IPostSystemMessageSent",
       desc: "system message sent",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPreMessageSentPrevent",
       desc: "block message from being sent",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPreMessageSentExtend",
       desc: "enrich message before send",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPreMessageSentModify",
       desc: "modify message before send",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPreMessageDeletePrevent",
       desc: "block message deletion",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPreMessageUpdatedPrevent",
       desc: "block message update",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPreMessageUpdatedExtend",
       desc: "enrich message before update",
-      param: "message",
-      shapeKey: "IMessage",
     },
     {
       name: "IPreMessageUpdatedModify",
       desc: "modify message before update",
-      param: "message",
-      shapeKey: "IMessage",
     },
   ],
   rooms: [
     {
       name: "IPostRoomCreate",
       desc: "after room created",
-      param: "room",
-      shapeKey: "IRoom",
     },
     {
       name: "IPostRoomDeleted",
       desc: "after room deleted",
-      param: "room",
-      shapeKey: "IRoom",
     },
     {
       name: "IPostRoomUserJoined",
       desc: "after user joins room",
-      param: "context",
-      shapeKey: "IRoomUserJoinedContext",
     },
     {
       name: "IPostRoomUserLeave",
       desc: "after user leaves room",
-      param: "context",
-      shapeKey: "IRoomUserLeaveContext",
     },
     {
       name: "IPreRoomCreatePrevent",
       desc: "block room creation",
-      param: "room",
-      shapeKey: "IRoom",
     },
     {
       name: "IPreRoomCreateExtend",
       desc: "enrich room before creation",
-      param: "room",
-      shapeKey: "IRoom",
     },
     {
       name: "IPreRoomCreateModify",
       desc: "modify room before creation",
-      param: "room",
-      shapeKey: "IRoom",
     },
     {
       name: "IPreRoomDeletePrevent",
       desc: "block room deletion",
-      param: "room",
-      shapeKey: "IRoom",
     },
     {
       name: "IPreRoomUserJoined",
       desc: "before user joins room",
-      param: "context",
-      shapeKey: "IRoomUserJoinedContext",
     },
     {
       name: "IPreRoomUserLeave",
       desc: "before user leaves room",
-      param: "context",
-      shapeKey: "IRoomUserLeaveContext",
     },
   ],
   livechat: [
     {
       name: "IPostLivechatRoomStarted",
       desc: "livechat room started",
-      param: "room",
-      shapeKey: "ILivechatRoom",
     },
     {
       name: "IPostLivechatRoomClosed",
       desc: "livechat room closed",
-      param: "room",
-      shapeKey: "ILivechatRoom",
     },
     {
       name: "IPostLivechatAgentAssigned",
       desc: "agent assigned to livechat",
-      param: "context",
-      shapeKey: "ILivechatEventContext",
     },
     {
       name: "IPostLivechatAgentUnassigned",
       desc: "agent removed from livechat",
-      param: "context",
-      shapeKey: "ILivechatEventContext",
     },
     {
       name: "IPostLivechatRoomTransferred",
       desc: "livechat room transferred",
-      param: "context",
-      shapeKey: "ILivechatTransferEventContext",
     },
     {
       name: "IPostLivechatGuestSaved",
       desc: "visitor info saved",
-      param: "context",
-      shapeKey: "IVisitor",
     },
     {
       name: "IPostLivechatRoomSaved",
       desc: "livechat room info saved",
-      param: "context",
-      shapeKey: "ILivechatRoom",
     },
     {
       name: "IPostLivechatDepartmentRemoved",
       desc: "livechat department removed",
-      param: "context",
-      shapeKey: "ILivechatDepartmentEventContext",
     },
     {
       name: "IPostLivechatDepartmentDisabled",
       desc: "livechat department disabled",
-      param: "context",
-      shapeKey: "ILivechatDepartmentEventContext",
     },
     {
       name: "IPreLivechatRoomCreatePrevent",
       desc: "block livechat room creation",
-      param: "room",
-      shapeKey: "ILivechatRoom",
     },
   ],
   users: [
     {
       name: "IPostUserCreated",
       desc: "new user registered",
-      param: "context",
-      shapeKey: "IUserContext",
     },
     {
       name: "IPostUserUpdated",
       desc: "user profile updated",
-      param: "context",
-      shapeKey: "IUserContext",
     },
     {
       name: "IPostUserDeleted",
       desc: "user account deleted",
-      param: "context",
-      shapeKey: "IUserContext",
     },
     {
       name: "IPostUserLoggedIn",
       desc: "user logged in",
-      param: "context",
-      shapeKey: "IUser",
     },
     {
       name: "IPostUserLoggedOut",
       desc: "user logged out",
-      param: "context",
-      shapeKey: "IUser",
     },
     {
       name: "IPostUserStatusChanged",
       desc: "user status changed (online/away/busy/offline)",
-      param: "context",
-      shapeKey: "IUserStatusContext",
     },
   ],
   email: [
     {
       name: "IPreEmailSent",
       desc: "before outgoing email sent",
-      param: "context",
-      shapeKey: "IPreEmailSentContext",
     },
   ],
   uploads: [
     {
       name: "IPreFileUpload",
       desc: "before file upload",
-      param: "context",
-      shapeKey: "IFileUploadContext",
     },
   ],
   externalComponent: [
     {
       name: "IPostExternalComponentOpened",
       desc: "external component opened",
-      param: "externalComponent",
-      shapeKey: "IExternalComponent",
     },
     {
       name: "IPostExternalComponentClosed",
       desc: "external component closed",
-      param: "externalComponent",
-      shapeKey: "IExternalComponent",
     },
   ],
 };
@@ -567,90 +302,28 @@ export function formatAppEventsGuide(): string {
   return (
     `\n\n── App Events (${total} realtime handlers — use when prompt says "when X happens, do Y") ──\n\n` +
     sections.join("\n\n") +
-    `\n\nPick interface names and pass them as eventInterfaces to generate. ` +
+    `\n\nUse interface names as \`triggerEvent\` on individual workflows. ` +
     `Call get_endpoint_schemas with eventInterfaces to get exact param shapes before writing workflows.`
   );
-}
-
-function stringifyShape(obj: Record<string, unknown>): string {
-  const parts: string[] = [];
-  for (const [key, val] of Object.entries(obj)) {
-    if (typeof val === "object" && val !== null) {
-      parts.push(`${key}: ${stringifyShape(val as Record<string, unknown>)}`);
-    } else {
-      const s = String(val);
-      parts.push(s.endsWith("?") ? `${key}?` : key);
-    }
-  }
-  return `{ ${parts.join(", ")} }`;
-}
-
-export function formatEventShapesGuide(): string {
-  const byShape = new Map<string, string[]>();
-
-  for (const entries of Object.values(APP_EVENTS)) {
-    for (const e of entries) {
-      if (!e.param || !e.shapeKey) continue;
-      const key = `${e.param}|${e.shapeKey}`;
-      const list = byShape.get(key) ?? [];
-      list.push(`${e.name}.${e.param}`);
-      byShape.set(key, list);
-    }
-  }
-
-  const lines: string[] = [];
-  for (const [key, names] of byShape) {
-    const shapeKey = key.split("|")[1];
-    const shape = SHAPES[shapeKey];
-    if (!shape) continue;
-    lines.push(`${names.join(" | ")}: ${stringifyShape(shape)}`);
-  }
-
-  return (
-    `\n\n── Event Param Shapes (access via {{params.<param>.<field>}}) ──\n\n` +
-    lines.join("\n") +
-    `\n\nNested fields shown as { key: { subkey } }. Use exact field names in workflow templates.`
-  );
-}
-
-function collectTemplatePaths(
-  obj: Record<string, unknown>,
-  prefix: string,
-): string[] {
-  const paths: string[] = [];
-  for (const [key, val] of Object.entries(obj)) {
-    const p = `${prefix}.${key}`;
-    if (val && typeof val === "object" && !Array.isArray(val)) {
-      paths.push(...collectTemplatePaths(val as Record<string, unknown>, p));
-    } else {
-      paths.push(`{{${p}}}`);
-    }
-  }
-  return paths;
 }
 
 export function getEventShapes(
   interfaceNames: string[],
 ): Record<string, Record<string, unknown>> {
+  const infoMap = resolveEventInfo(interfaceNames);
   const result: Record<string, Record<string, unknown>> = {};
   for (const ifaceName of interfaceNames) {
-    for (const entries of Object.values(APP_EVENTS)) {
-      const found = entries.find((e) => e.name === ifaceName);
-      if (found?.param && found.shapeKey && SHAPES[found.shapeKey]) {
-        result[ifaceName] = { [found.param]: SHAPES[found.shapeKey] };
-        break;
-      }
+    const info = infoMap[ifaceName];
+    if (info?.shape) {
+      result[ifaceName] = { [info.param]: info.shape };
     }
   }
   return result;
 }
 
 export function getEventParamName(interfaceName: string): string | null {
-  for (const entries of Object.values(APP_EVENTS)) {
-    const found = entries.find((e) => e.name === interfaceName);
-    if (found?.param) return found.param;
-  }
-  return null;
+  const infoMap = resolveEventInfo([interfaceName]);
+  return infoMap[interfaceName]?.param ?? null;
 }
 
-export { APP_EVENTS, SHAPES, stringifyShape };
+export { APP_EVENTS };

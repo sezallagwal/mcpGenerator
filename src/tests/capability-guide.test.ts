@@ -3,13 +3,11 @@ import assert from "node:assert/strict";
 import {
   formatCapabilityGuide,
   formatAppEventsGuide,
-  formatEventShapesGuide,
   getEventParamName,
   getEventShapes,
   APP_EVENTS,
-  SHAPES,
-  stringifyShape,
 } from "../capability-guide.js";
+import { resolveEventInfo } from "../rc-app/parser.js";
 import type { CompactEndpoint } from "../mcp-server/parser/types.js";
 
 function makeEndpoint(
@@ -57,7 +55,11 @@ describe("formatCapabilityGuide", () => {
 
     assert.ok(result.includes("## messaging"));
     assert.ok(result.includes("## rooms"));
-    assert.ok(result.includes("Send Message → post-api-v1-chat_sendMessage"));
+    assert.ok(
+      result.includes(
+        "Send Message (needs rid; supports tmid for threads) → post-api-v1-chat_sendMessage",
+      ),
+    );
     assert.ok(result.includes("Delete Message → post-api-v1-chat_delete"));
     assert.ok(result.includes("Create Room → post-api-v1-channels_create"));
   });
@@ -143,7 +145,11 @@ describe("formatCapabilityGuide", () => {
       }),
     ];
     const result = formatCapabilityGuide(endpoints);
-    assert.ok(result.includes("Post Message → post-api-v1-chat_postMessage"));
+    assert.ok(
+      result.includes(
+        "Post Message (resolves #channel and @user names) → post-api-v1-chat_postMessage",
+      ),
+    );
     assert.ok(!result.includes("[channel, text"));
     assert.ok(result.includes("Delete Message → post-api-v1-chat_delete"));
   });
@@ -225,10 +231,99 @@ describe("formatCapabilityGuide", () => {
     const lines = result.split("\n");
     const roomsIdx = lines.findIndex((l) => l.startsWith("## rooms"));
     assert.ok(roomsIdx >= 0);
-    const summaryLine = lines[roomsIdx + 1];
-    assert.ok(summaryLine.includes("Create Channel → op1"));
-    assert.ok(summaryLine.includes("Create Room → op2"));
-    assert.ok(summaryLine.includes("Create Team → op3"));
+    // Domain note line sits between header and entries, so find the entries line by content
+    const entriesLine = lines.slice(roomsIdx + 1).find((l) => l.includes("→"));
+    assert.ok(entriesLine, "should have an entries line with →");
+    assert.ok(entriesLine.includes("Create Channel → op1"));
+    assert.ok(entriesLine.includes("Create Room → op2"));
+    assert.ok(entriesLine.includes("Create Team → op3"));
+  });
+
+  it("annotates confusing endpoints with inline hints", () => {
+    const endpoints = [
+      makeEndpoint({
+        domain: "messaging",
+        tag: "Chat",
+        summary: "Post Message",
+        operationId: "post-api-v1-chat_postMessage",
+      }),
+      makeEndpoint({
+        domain: "messaging",
+        tag: "Chat",
+        summary: "Search Message",
+        operationId: "get-api-v1-chat_search",
+      }),
+      makeEndpoint({
+        domain: "messaging",
+        tag: "Chat",
+        summary: "Delete Message",
+        operationId: "post-api-v1-chat_delete",
+      }),
+    ];
+    const result = formatCapabilityGuide(endpoints);
+
+    // Annotated endpoints include the hint
+    assert.ok(
+      result.includes(
+        "Post Message (resolves #channel and @user names) → post-api-v1-chat_postMessage",
+      ),
+    );
+    assert.ok(
+      result.includes(
+        "Search Message (searches message text content by keyword in a room) → get-api-v1-chat_search",
+      ),
+    );
+    // Non-annotated endpoint stays plain
+    assert.ok(result.includes("Delete Message → post-api-v1-chat_delete"));
+    assert.ok(!result.includes("Delete Message ("));
+  });
+
+  it("adds domain note at top of rooms section", () => {
+    const endpoints = [
+      makeEndpoint({
+        domain: "rooms",
+        tag: "Channels",
+        summary: "Get Channel List",
+        operationId: "get-api-v1-channels_list",
+      }),
+    ];
+    const result = formatCapabilityGuide(endpoints);
+
+    const lines = result.split("\n");
+    const roomsIdx = lines.findIndex((l) => l.startsWith("## rooms"));
+    assert.ok(roomsIdx >= 0);
+    // Note line should be right after the header
+    assert.ok(
+      lines[roomsIdx + 1].includes("channels_* = public only"),
+      "domain note should appear after ## rooms header",
+    );
+    // Entries should follow the note
+    assert.ok(
+      lines[roomsIdx + 2].includes(
+        "Get Channel List (all channels; sortable; full objects with _id) → get-api-v1-channels_list",
+      ),
+    );
+  });
+
+  it("does NOT add domain note for domains without one", () => {
+    const endpoints = [
+      makeEndpoint({
+        domain: "messaging",
+        tag: "Chat",
+        summary: "Send Message",
+        operationId: "post-api-v1-chat_sendMessage",
+      }),
+    ];
+    const result = formatCapabilityGuide(endpoints);
+
+    const lines = result.split("\n");
+    const msgIdx = lines.findIndex((l) => l.startsWith("## messaging"));
+    assert.ok(msgIdx >= 0);
+    // Very next line should be entries, not a note
+    assert.ok(
+      lines[msgIdx + 1].includes("→"),
+      "messaging section should have entries immediately after header",
+    );
   });
 });
 
@@ -267,8 +362,8 @@ describe("formatAppEventsGuide", () => {
 
   it("includes footer with get_endpoint_schemas instruction", () => {
     const result = formatAppEventsGuide();
+    assert.ok(result.includes("triggerEvent"));
     assert.ok(result.includes("eventInterfaces"));
-    assert.ok(result.includes("generate"));
     assert.ok(result.includes("get_endpoint_schemas"));
   });
 
@@ -315,66 +410,72 @@ describe("formatAppEventsGuide", () => {
     }
   });
 
-  it("every entry has param and shapeKey", () => {
+  it("every entry resolves param, shapeKey, and shape at runtime", () => {
     for (const [category, entries] of Object.entries(APP_EVENTS)) {
       for (const entry of entries) {
+        const infoMap = resolveEventInfo([entry.name]);
+        const info = infoMap[entry.name];
         assert.ok(
-          entry.param && entry.param.length > 0,
-          `Missing param for ${entry.name} in ${category}`,
+          info,
+          `resolveEventInfo returned nothing for ${entry.name} in ${category}`,
         );
         assert.ok(
-          entry.shapeKey && entry.shapeKey.length > 0,
-          `Missing shapeKey for ${entry.name} in ${category}`,
+          info.param.length > 0,
+          `Empty param for ${entry.name} in ${category}`,
         );
         assert.ok(
-          SHAPES[entry.shapeKey],
-          `shapeKey "${entry.shapeKey}" for ${entry.name} not found in SHAPES`,
+          info.shapeKey.length > 0,
+          `Empty shapeKey for ${entry.name} in ${category}`,
+        );
+        assert.ok(
+          info.shape,
+          `No shape resolved for ${entry.name} (shapeKey: ${info.shapeKey}) in ${category}`,
         );
       }
     }
   });
 });
 
-describe("formatEventShapesGuide", () => {
-  it("includes header and footer", () => {
-    const result = formatEventShapesGuide();
-    assert.ok(result.includes("Event Param Shapes"));
-    assert.ok(result.includes("params"));
-    assert.ok(result.includes("Nested fields"));
+describe("resolveEventInfo", () => {
+  it("returns param, shapeKey, and shape for a known interface", () => {
+    const result = resolveEventInfo(["IPostMessageSent"]);
+    const info = result["IPostMessageSent"];
+    assert.ok(info);
+    assert.equal(info.param, "message");
+    assert.equal(info.shapeKey, "IMessage");
+    assert.ok(info.shape);
+    assert.ok("text?" in info.shape || "sender" in info.shape);
   });
 
-  it("deduplicates interfaces sharing the same shape", () => {
-    const result = formatEventShapesGuide();
-    const messageLine = result
-      .split("\n")
-      .find((l) => l.includes("IPostMessageSent.message"));
-    assert.ok(messageLine, "Should have a line for IPostMessageSent");
-    assert.ok(
-      messageLine!.includes("IPostMessageDeleted.message"),
-      "Should group IPostMessageDeleted on same line",
+  it("returns empty record for unknown interface", () => {
+    const result = resolveEventInfo(["INonExistent"]);
+    assert.deepEqual(result, {});
+  });
+
+  it("batches multiple interfaces in one call", () => {
+    const result = resolveEventInfo([
+      "IPostMessageSent",
+      "IPostRoomCreate",
+      "IPostUserCreated",
+    ]);
+    assert.equal(Object.keys(result).length, 3);
+    assert.equal(result["IPostMessageSent"].param, "message");
+    assert.equal(result["IPostRoomCreate"].param, "room");
+    assert.equal(result["IPostUserCreated"].param, "context");
+  });
+
+  it("deduplicates shared shapeKeys across interfaces", () => {
+    // IPostMessageSent and IPostMessageDeleted both use IMessage
+    const result = resolveEventInfo([
+      "IPostMessageSent",
+      "IPostMessageDeleted",
+    ]);
+    assert.equal(result["IPostMessageSent"].shapeKey, "IMessage");
+    assert.equal(result["IPostMessageDeleted"].shapeKey, "IMessage");
+    assert.deepEqual(
+      result["IPostMessageSent"].shape,
+      result["IPostMessageDeleted"].shape,
     );
-  });
-
-  it("shows nested field structure", () => {
-    const result = formatEventShapesGuide();
-    assert.ok(result.includes("sender: { id, username"));
-    assert.ok(result.includes("creator: { id, username"));
-  });
-
-  it("uses id not _id", () => {
-    const result = formatEventShapesGuide();
-    assert.ok(!result.includes("_id"));
-  });
-
-  it("covers all SHAPES entries", () => {
-    const result = formatEventShapesGuide();
-    for (const [key, shape] of Object.entries(SHAPES)) {
-      const str = stringifyShape(shape);
-      assert.ok(
-        result.includes(str),
-        `Shape for ${key} not found in guide output`,
-      );
-    }
   });
 });
 
@@ -411,7 +512,6 @@ describe("getEventParamName", () => {
       for (const entry of entries) {
         const result = getEventParamName(entry.name);
         assert.ok(result, `No param for ${entry.name}`);
-        assert.equal(result, entry.param);
       }
     }
   });

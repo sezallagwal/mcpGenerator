@@ -1,21 +1,131 @@
 import type { WorkflowDefinition } from "./types.js";
 import type { FullEndpoint } from "./parser/types.js";
 
-const OPERATION_PERMISSION_MAP: Array<{ pattern: RegExp; permissions: string[] }> = [
-  { pattern: /channels[._-]invite/, permissions: ["add-user-to-joined-room", "add-user-to-any-c-room"] },
-  { pattern: /groups[._-]invite/, permissions: ["add-user-to-joined-room"] },
-  { pattern: /channels[._-]create/, permissions: ["create-c"] },
-  { pattern: /groups[._-]create/, permissions: ["create-p"] },
-  { pattern: /im[._-]create|dm[._-]create/, permissions: ["create-d"] },
-  { pattern: /chat[._-]postMessage|chat[._-]sendMessage/, permissions: ["create-d"] },
-  { pattern: /chat[._-]delete|chat[._-]update/, permissions: ["delete-message"] },
-  { pattern: /channels[._-]kick|groups[._-]kick/, permissions: ["remove-user"] },
-  { pattern: /users[._-]info|users[._-]list/, permissions: ["view-full-other-user-info"] },
+// ── Category-based permission map ─────────────────────────────────────────
+// When a workflow uses ANY endpoint in a category, grant ALL relevant
+// permissions for that category.
+
+const OPERATION_PERMISSION_MAP: Array<{
+  pattern: RegExp;
+  permissions: string[];
+}> = [
+  // Channels (public rooms) — any channels.* operation
+  {
+    pattern: /channels[._-]/,
+    permissions: [
+      "create-c",
+      "view-c-room",
+      "view-joined-room",
+      "edit-room",
+      "set-readonly",
+      "archive-room",
+      "unarchive-room",
+      "post-readonly",
+      "clean-channel-history",
+    ],
+  },
+  // Groups (private rooms) — any groups.* operation
+  {
+    pattern: /groups[._-]/,
+    permissions: [
+      "create-p",
+      "view-p-room",
+      "view-joined-room",
+      "edit-room",
+      "set-readonly",
+      "archive-room",
+      "unarchive-room",
+      "post-readonly",
+    ],
+  },
+  // DMs — any im.* or dm.* operation
+  {
+    pattern: /im[._-]|dm[._-]/,
+    permissions: ["create-d", "view-d-room", "view-joined-room"],
+  },
+  // Chat (messaging) — any chat.* operation
+  {
+    pattern: /chat[._-]/,
+    permissions: ["create-d", "post-readonly"],
+  },
+  // Chat destructive ops — delete/update messages
+  {
+    pattern: /chat[._-](delete|update)/,
+    permissions: ["edit-message", "delete-message"],
+  },
+  // Chat pin/star
+  {
+    pattern: /chat[._-](pin|star)/,
+    permissions: ["pin-message"],
+  },
+  // Invite/kick across channels and groups
+  {
+    pattern: /channels[._-](invite|kick)|groups[._-](invite|kick)/,
+    permissions: [
+      "add-user-to-joined-room",
+      "add-user-to-any-c-room",
+      "add-user-to-any-p-room",
+      "remove-user",
+    ],
+  },
+  // Users — any users.* read operation
+  {
+    pattern: /users[._-]/,
+    permissions: ["view-full-other-user-info"],
+  },
+  // Users — admin/write operations
+  {
+    pattern: /users[._-](create|update|delete|setActiveStatus)/,
+    permissions: [
+      "create-user",
+      "edit-other-user-info",
+      "edit-other-user-active-status",
+    ],
+  },
+  // Rooms — any rooms.* operation (cross-type)
+  {
+    pattern: /rooms[._-]/,
+    permissions: ["view-c-room", "view-p-room", "view-joined-room"],
+  },
+  // Rooms — mute/unmute
+  {
+    pattern: /rooms[._-](muteUser|unmuteUser)/,
+    permissions: ["mute-user"],
+  },
+  // Channel/group deletion
+  {
+    pattern: /channels[._-]delete/,
+    permissions: ["delete-c"],
+  },
+  {
+    pattern: /groups[._-]delete/,
+    permissions: ["delete-p"],
+  },
+  // Discussions
+  {
+    pattern: /[Dd]iscussions/,
+    permissions: ["start-discussion"],
+  },
+  // Roles/permissions admin
+  {
+    pattern: /roles[._-]|permissions[._-]/,
+    permissions: ["access-permissions"],
+  },
+  // Custom emoji
+  {
+    pattern: /emoji[._-]custom/,
+    permissions: ["manage-emoji"],
+  },
 ];
 
-const BASE_BOT_PERMISSIONS = ["create-personal-access-tokens"];
+const BASE_BOT_PERMISSIONS = [
+  "create-personal-access-tokens",
+  "view-outside-room",
+];
 
-export function deriveRequiredPermissions(workflows: WorkflowDefinition[]): string[] {
+export function deriveRequiredPermissions(
+  workflows: WorkflowDefinition[],
+): string[] {
   const perms = new Set<string>(BASE_BOT_PERMISSIONS);
   const allOps = new Set<string>();
   for (const wf of workflows) {
@@ -142,20 +252,17 @@ export function generateWorkflowToolCode(workflow: WorkflowDefinition): string {
   }
 
   const stepDefs = workflow.steps.map((step) => {
+    const { type, ...configFields } = step.config;
     const base: Record<string, unknown> = {
       id: step.id,
       label: step.label,
-      type: step.config.type,
+      type,
       dependsOn: step.dependsOn || [],
+      ...configFields,
     };
 
-    switch (step.config.type) {
+    switch (type) {
       case "api_call":
-        base.operationId = step.config.operationId;
-        base.inputMapping = step.config.inputMapping;
-        if (step.config.outputPath) base.outputPath = step.config.outputPath;
-        if (step.config.forEach) base.forEach = step.config.forEach;
-        if (step.config.as) base.as = step.config.as;
         if (step.config.operationId === "post-api-v1-chat_postMessage") {
           const channel = (step.config.inputMapping as Record<string, unknown>)
             ?.channel;
@@ -176,12 +283,18 @@ export function generateWorkflowToolCode(workflow: WorkflowDefinition): string {
           base.continueOnError = true;
         }
         if (!base.continueOnError) {
-          const mapping = step.config.inputMapping as Record<string, unknown> | undefined;
+          const mapping = step.config.inputMapping as
+            | Record<string, unknown>
+            | undefined;
           if (mapping) {
             const ROOM_FIELDS = ["roomName", "roomId", "channel"];
             for (const field of ROOM_FIELDS) {
               const val = mapping[field];
-              if (typeof val === "string" && val.length > 0 && !val.includes("{{")) {
+              if (
+                typeof val === "string" &&
+                val.length > 0 &&
+                !val.includes("{{")
+              ) {
                 base.continueOnError = true;
                 break;
               }
@@ -190,12 +303,9 @@ export function generateWorkflowToolCode(workflow: WorkflowDefinition): string {
         }
         break;
       case "sampling":
-        base.prompt = step.config.prompt;
-        if (step.config.content) base.content = step.config.content;
-        if (step.config.systemPrompt)
-          base.systemPrompt = step.config.systemPrompt;
-        if (step.config.maxTokens) base.maxTokens = step.config.maxTokens;
+        // Fallback: detect JSON intent from prompt if no explicit responseFormat
         if (
+          !base.responseFormat &&
           detectJsonIntentFromStrings(
             step.config.systemPrompt,
             step.config.prompt,
@@ -204,19 +314,7 @@ export function generateWorkflowToolCode(workflow: WorkflowDefinition): string {
           base.responseFormat = "json";
         }
         break;
-      case "elicitation":
-        base.message = step.config.message;
-        base.requestedSchema = step.config.requestedSchema;
-        if (step.config.onDecline) base.onDecline = step.config.onDecline;
-        break;
-      case "transform":
-        base.expression = step.config.expression;
-        break;
-      case "conditional":
-        base.condition = step.config.condition;
-        base.thenStep = step.config.thenStep;
-        if (step.config.elseStep) base.elseStep = step.config.elseStep;
-        break;
+      // elicitation, transform, conditional: all fields come from the spread
     }
 
     return base;
@@ -292,9 +390,11 @@ import { runWorkflow, type StepDefinition } from "../engine/workflow-engine.js";
 // This will be injected by the server entry
 let server: any;
 let client: any;
+let botUsernames: string[] = [];
 
 export function setServer(s: any) { server = s; }
 export function setClient(c: any) { client = c; }
+export function setBotUsernames(...usernames: string[]) { botUsernames = usernames; }
 
 /**
  * Endpoint registry — maps operationId to method + path.
@@ -318,7 +418,7 @@ export const tool = {
   inputSchema: ${schemaStr},
   handler: async (args: Record<string, unknown>, extra?: any) => {
     return runWorkflow(
-      { server, client, endpoints, name: "${esc(workflow.name)}", extra },
+      { server, client, endpoints, name: "${esc(workflow.name)}", extra, botUsernames },
       steps,
       args,
     );
@@ -338,12 +438,12 @@ export function generateMcpServerEntryCode(
 
   const workflowImports = workflows.map(
     (w, i) =>
-      `import { tool as wfTool${i}, setServer as setServer${i}, setClient as setClient${i}, registerEndpoints as registerEndpoints${i} } from "./tools/${w.name}.js";`,
+      `import { tool as wfTool${i}, setServer as setServer${i}, setClient as setClient${i}, registerEndpoints as registerEndpoints${i}, setBotUsernames as setBotUsernames${i} } from "./tools/${w.name}.js";`,
   );
 
   const workflowSetup = workflows.map(
     (_, i) =>
-      `setServer${i}(server);\nsetClient${i}(client);\nregisterEndpoints${i}(endpointMap);`,
+      `setServer${i}(server);\nsetClient${i}(client);\nregisterEndpoints${i}(endpointMap);\nsetBotUsernames${i}("${esc(serverName)}.bot", BOT_USERNAME);`,
   );
 
   const endpointMapEntries = endpoints.map((ep) => {
@@ -358,7 +458,10 @@ export function generateMcpServerEntryCode(
 
   const requiredPerms = deriveRequiredPermissions(workflows);
   const derivedPermEntries = requiredPerms
-    .map((p) => `                { _id: "${esc(p)}", roles: ["admin", "owner", "moderator", "bot"] },`)
+    .map(
+      (p) =>
+        `                { _id: "${esc(p)}", roles: ["admin", "owner", "moderator", "bot"] },`,
+    )
     .join("\n");
 
   return `#!/usr/bin/env node
@@ -393,6 +496,8 @@ const server = new McpServer(
 async function main() {
   const { client, initAuth, get2faHash } = await import("./rc-client.js");
   await initAuth();
+
+  const BOT_USERNAME = "${esc(serverName)}-bot";
 
   // Wire workflow tools with server + client references
 ${workflowSetup.join("\n")}
@@ -589,18 +694,7 @@ ${
             if (!createRes.isError) console.error(\`[Auto-config] Created bot user: \${BOT_USERNAME}\`);
             else console.error(\`[Auto-config] Bot user \${BOT_USERNAME} already exists, reusing.\`);
 
-            // A2. Grant necessary permissions to bot role
-            const permsRes = await client.request("POST", "/api/v1/permissions.update", {
-              auth: true,
-              headers: twoFaHeaders,
-              body: { permissions: [
-${derivedPermEntries}
-              ]},
-            });
-            if (!permsRes.isError) console.error("[Auto-config] Bot role permissions updated.");
-            else console.error(\`[Auto-config] Warning: could not update permissions: \${permsRes.content[0]?.text}\`);
-
-            // A3. Temporarily disable email-2FA so bot can log in
+            // A2. Temporarily disable email-2FA so bot can log in
             let twoFaWasEnabled = false;
             const twoFaSettingRes = await client.request("GET", "/api/v1/settings/Accounts_TwoFactorAuthentication_By_Email_Enabled", { auth: true });
             if (!twoFaSettingRes.isError) {
@@ -763,6 +857,23 @@ ${derivedPermEntries}
             }
           } catch {}
         }
+      }
+
+      // B3.5. Grant necessary permissions to bot role (runs every startup)
+      {
+        const adminPass = process.env.ROCKETCHAT_PASSWORD || "";
+        const twoFaHeaders: Record<string, string> = adminPass
+          ? { "x-2fa-code": get2faHash(adminPass), "x-2fa-method": "password" }
+          : {};
+        const permsRes = await client.request("POST", "/api/v1/permissions.update", {
+          auth: true,
+          headers: twoFaHeaders,
+          body: { permissions: [
+${derivedPermEntries}
+          ]},
+        });
+        if (!permsRes.isError) console.error("[Auto-config] Bot role permissions updated.");
+        else console.error(\`[Auto-config] Warning: could not update permissions: \${permsRes.content[0]?.text}\`);
       }
 
       const curSettings = await client.request("GET", \`/api/apps/\${appId}/settings\`, { auth: true });
