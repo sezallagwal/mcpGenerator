@@ -4,8 +4,10 @@ import { resolveEventInfo } from "./rc-app/parser.js";
 /** Inline hints appended to confusing endpoints: `Summary (hint) → operationId` */
 const ENDPOINT_ANNOTATIONS: Record<string, string> = {
   // messaging — postMessage vs sendMessage
-  "post-api-v1-chat_postMessage": "resolves #channel and @user names",
-  "post-api-v1-chat_sendMessage": "needs rid; supports tmid for threads",
+  "post-api-v1-chat_postMessage":
+    "resolves #channel and @user names; processes @here/@all mentions; use when sending by channel name",
+  "post-api-v1-chat_sendMessage":
+    "needs rid; supports tmid for threads; does NOT resolve @here, @all, @user mentions or #channel names — use postMessage if you need mention pings or channel-name lookup",
   // messaging — search
   "get-api-v1-chat_search":
     "searches message text content by keyword in a room",

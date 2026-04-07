@@ -12,7 +12,5 @@ Otherwise — even if the request is complex — ALWAYS run the full pipeline wi
 
 Never stop to ask about implementation approach, limitations, or simplifications. If something can't be done exactly, approximate and generate anyway.
 
-After `generate` succeeds, DO NOT try to read or edit files inside the generated project. The output is ready to use as-is. Any "Composer Notes" in the output are auto-resolved and need no action.
-
-Confirm success briefly.
+After `generate` succeeds, STOP. DO NOT read, edit, grep, or "fix" any files inside the generated project — even if the output mentions warnings, notes, or suggestions. Composer Notes are informational; they are already auto-resolved in the generated code. Confirm success and stop.
 """

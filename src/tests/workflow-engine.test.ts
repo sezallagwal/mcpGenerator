@@ -310,6 +310,37 @@ describe("shouldRun", () => {
     assert.equal(shouldRun("s3", state), false);
     assert.equal(state.stepStatus.s3, "skipped");
   });
+
+  it("runs step when SOME deps skipped but at least one succeeded", () => {
+    const state = makeState({
+      stepDeps: { merge: ["branch_a", "branch_b"] },
+      completedSteps: ["branch_a"],
+      stepStatus: { branch_a: "success", branch_b: "skipped" },
+      stepResults: { branch_a: "data", branch_b: null },
+    });
+    assert.equal(shouldRun("merge", state), true);
+    assert.equal(state.stepStatus.merge, undefined);
+  });
+
+  it("skips step only when ALL deps are skipped", () => {
+    const state = makeState({
+      stepDeps: { merge: ["branch_a", "branch_b"] },
+      stepStatus: { branch_a: "skipped", branch_b: "skipped" },
+      stepResults: { branch_a: null, branch_b: null },
+    });
+    assert.equal(shouldRun("merge", state), false);
+    assert.equal(state.stepStatus.merge, "skipped");
+  });
+
+  it("waits when some deps not yet terminal", () => {
+    const state = makeState({
+      stepDeps: { merge: ["branch_a", "branch_b"] },
+      completedSteps: ["branch_a"],
+      stepStatus: { branch_a: "success" },
+    });
+    assert.equal(shouldRun("merge", state), false);
+    assert.equal(state.stepStatus.merge, undefined);
+  });
 });
 
 describe("conditional branching", () => {
@@ -473,6 +504,153 @@ describe("conditional branching", () => {
     assert.ok(parsed.completedSteps.includes("dm_user"));
     assert.equal(parsed.stepResults.delete_msg, "deleted");
     assert.equal(parsed.stepResults.dm_user, "dm_sent");
+  });
+
+  it("merge-after-conditional: runs when then-branch succeeds", async () => {
+    const steps: StepDefinition[] = [
+      {
+        id: "check",
+        label: "Check condition",
+        type: "conditional",
+        condition: "true",
+        thenStep: "then_action",
+        elseStep: "else_action",
+        dependsOn: [],
+      },
+      {
+        id: "then_action",
+        label: "Then branch",
+        type: "transform",
+        expression: "'then_data'",
+        dependsOn: ["check"],
+      },
+      {
+        id: "else_action",
+        label: "Else branch",
+        type: "transform",
+        expression: "'else_data'",
+        dependsOn: ["check"],
+      },
+      {
+        id: "final_merge",
+        label: "Merge results",
+        type: "transform",
+        expression: "steps.then_action || steps.else_action",
+        dependsOn: ["then_action", "else_action"],
+      },
+    ];
+
+    const result = await runWorkflow(
+      { server: {}, client: {}, endpoints: {}, name: "test" },
+      steps,
+      {},
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.status, "success");
+    assert.ok(parsed.completedSteps.includes("then_action"));
+    assert.ok(!parsed.completedSteps.includes("else_action"));
+    assert.ok(parsed.completedSteps.includes("final_merge"));
+    assert.equal(parsed.stepResults.final_merge, "then_data");
+    assert.equal(parsed.stepResults.else_action, null);
+  });
+
+  it("merge-after-conditional: runs when else-branch succeeds", async () => {
+    const steps: StepDefinition[] = [
+      {
+        id: "check",
+        label: "Check condition",
+        type: "conditional",
+        condition: "false",
+        thenStep: "then_action",
+        elseStep: "else_action",
+        dependsOn: [],
+      },
+      {
+        id: "then_action",
+        label: "Then branch",
+        type: "transform",
+        expression: "'then_data'",
+        dependsOn: ["check"],
+      },
+      {
+        id: "else_action",
+        label: "Else branch",
+        type: "transform",
+        expression: "'else_data'",
+        dependsOn: ["check"],
+      },
+      {
+        id: "final_merge",
+        label: "Merge results",
+        type: "transform",
+        expression: "steps.then_action || steps.else_action",
+        dependsOn: ["then_action", "else_action"],
+      },
+    ];
+
+    const result = await runWorkflow(
+      { server: {}, client: {}, endpoints: {}, name: "test" },
+      steps,
+      {},
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.status, "success");
+    assert.ok(!parsed.completedSteps.includes("then_action"));
+    assert.ok(parsed.completedSteps.includes("else_action"));
+    assert.ok(parsed.completedSteps.includes("final_merge"));
+    assert.equal(parsed.stepResults.final_merge, "else_data");
+    assert.equal(parsed.stepResults.then_action, null);
+  });
+
+  it("merge-after-conditional: skips merge when all branches skipped", async () => {
+    const steps: StepDefinition[] = [
+      {
+        id: "check",
+        label: "Check condition",
+        type: "conditional",
+        condition: "false",
+        thenStep: "then_action",
+        dependsOn: [],
+      },
+      {
+        id: "then_action",
+        label: "Then branch",
+        type: "transform",
+        expression: "'then_data'",
+        dependsOn: ["check"],
+      },
+      {
+        id: "also_skipped",
+        label: "Also depends on then",
+        type: "transform",
+        expression: "'also'",
+        dependsOn: ["then_action"],
+      },
+      {
+        id: "final_merge",
+        label: "Merge results",
+        type: "transform",
+        expression: "'merged'",
+        dependsOn: ["then_action", "also_skipped"],
+      },
+    ];
+
+    const result = await runWorkflow(
+      { server: {}, client: {}, endpoints: {}, name: "test" },
+      steps,
+      {},
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.status, "success");
+    assert.ok(!parsed.completedSteps.includes("then_action"));
+    assert.ok(!parsed.completedSteps.includes("also_skipped"));
+    assert.ok(!parsed.completedSteps.includes("final_merge"));
+    assert.equal(parsed.stepResults.then_action, null);
+    assert.equal(parsed.stepResults.also_skipped, null);
+    assert.equal(parsed.stepResults.final_merge, null);
   });
 });
 
@@ -1363,6 +1541,111 @@ describe("engine safety nets", () => {
     assert.ok(
       parsed.stepErrors.invite_buddy.includes("resolved to empty"),
       "Error message should mention resolved to empty",
+    );
+  });
+
+  it("strips absent optional params instead of throwing", async () => {
+    let capturedBody: any = null;
+    const mockClient = {
+      request: async (_m: string, _p: string, opts: any) => {
+        capturedBody = opts.body;
+        return { message: { _id: "M1" }, success: true };
+      },
+    };
+
+    const steps: StepDefinition[] = [
+      {
+        id: "send_msg",
+        label: "Send Message",
+        type: "api_call",
+        operationId: "post-api-v1-chat_postMessage",
+        inputMapping: {
+          roomId: "{{params.room.id}}",
+          text: "Resolved!",
+          tmid: "{{params.threadId}}",
+        },
+        dependsOn: [],
+      },
+    ];
+
+    const result = await runWorkflow(
+      {
+        server: {},
+        client: mockClient,
+        endpoints: {
+          "post-api-v1-chat_postMessage": {
+            method: "POST",
+            path: "/api/v1/chat.postMessage",
+          },
+        },
+        name: "test",
+      },
+      steps,
+      // threadId is NOT in params at all — genuinely absent
+      {
+        room: { id: "R1", type: "c" },
+        sender: { username: "admin" },
+        query: "",
+      },
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(
+      parsed.stepErrors,
+      undefined,
+      "Should not have any step errors",
+    );
+    assert.equal(capturedBody.roomId, "R1");
+    assert.equal(capturedBody.text, "Resolved!");
+    assert.equal(
+      capturedBody.tmid,
+      undefined,
+      "tmid should be stripped from payload",
+    );
+  });
+
+  it("throws when root param exists but nested value is empty", async () => {
+    const mockClient = {
+      request: async () => ({ success: true }),
+    };
+
+    const steps: StepDefinition[] = [
+      {
+        id: "send_msg",
+        label: "Send Message",
+        type: "api_call",
+        operationId: "post-api-v1-chat_postMessage",
+        inputMapping: {
+          roomId: "{{params.room.id}}",
+          text: "Hello",
+        },
+        dependsOn: [],
+        continueOnError: true,
+      },
+    ];
+
+    const result = await runWorkflow(
+      {
+        server: {},
+        client: mockClient,
+        endpoints: {
+          "post-api-v1-chat_postMessage": {
+            method: "POST",
+            path: "/api/v1/chat.postMessage",
+          },
+        },
+        name: "test",
+      },
+      steps,
+      // room EXISTS but id is missing — root present, value empty
+      { room: {}, sender: { username: "admin" }, query: "" },
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    assert.ok(parsed.stepErrors.send_msg);
+    assert.ok(
+      parsed.stepErrors.send_msg.includes("resolved to empty"),
+      "Should throw when root exists but value resolves to empty",
     );
   });
 
@@ -2366,5 +2649,121 @@ describe("bot message filtering in workflow execution", () => {
       2,
       "should keep all messages without botUsernames",
     );
+  });
+});
+
+// ── Approach 5: scope injection for bare param names ─────────────────────
+
+describe("bare param names via buildJsScope (Approach 5)", () => {
+  it("transform resolves bare param names", async () => {
+    const steps: StepDefinition[] = [
+      {
+        id: "calc",
+        label: "Calc",
+        type: "transform",
+        expression: "({ roomId: room.id, user: sender.username })",
+      },
+    ];
+    const result = await runWorkflow(
+      { server: {}, client: {}, endpoints: {}, name: "test" },
+      steps,
+      { room: { id: "R123" }, sender: { username: "alice" } },
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    assert.deepStrictEqual(parsed.stepResults.calc, {
+      roomId: "R123",
+      user: "alice",
+    });
+  });
+
+  it("transform also works with params.X prefix", async () => {
+    const steps: StepDefinition[] = [
+      {
+        id: "calc",
+        label: "Calc",
+        type: "transform",
+        expression:
+          "({ roomId: params.room.id, user: params.sender.username })",
+      },
+    ];
+    const result = await runWorkflow(
+      { server: {}, client: {}, endpoints: {}, name: "test" },
+      steps,
+      { room: { id: "R123" }, sender: { username: "alice" } },
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    assert.deepStrictEqual(parsed.stepResults.calc, {
+      roomId: "R123",
+      user: "alice",
+    });
+  });
+
+  it("conditional resolves bare param names", async () => {
+    const steps: StepDefinition[] = [
+      {
+        id: "check",
+        label: "Check",
+        type: "conditional",
+        condition: "room.id === 'R123'",
+        thenStep: "yes",
+        elseStep: "no",
+      },
+      {
+        id: "yes",
+        label: "Yes",
+        type: "transform",
+        expression: "'matched'",
+        dependsOn: ["check"],
+      },
+      {
+        id: "no",
+        label: "No",
+        type: "transform",
+        expression: "'nope'",
+        dependsOn: ["check"],
+      },
+    ];
+    const result = await runWorkflow(
+      { server: {}, client: {}, endpoints: {}, name: "test" },
+      steps,
+      { room: { id: "R123" } },
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    assert.strictEqual(parsed.stepResults.check, true);
+    assert.strictEqual(parsed.stepResults.yes, "matched");
+  });
+
+  it("step result chains with param-like names are not broken", async () => {
+    const steps: StepDefinition[] = [
+      {
+        id: "get_info",
+        label: "Get Info",
+        type: "transform",
+        expression: "({ room: { name: 'general', type: 'c' } })",
+      },
+      {
+        id: "check",
+        label: "Check",
+        type: "conditional",
+        condition: "steps.get_info.room.type === 'c'",
+        thenStep: "ok",
+        dependsOn: ["get_info"],
+      },
+      {
+        id: "ok",
+        label: "OK",
+        type: "transform",
+        expression: "'channel'",
+        dependsOn: ["check"],
+      },
+    ];
+    const result = await runWorkflow(
+      { server: {}, client: {}, endpoints: {}, name: "test" },
+      steps,
+      { room: { id: "R999" } },
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    assert.strictEqual(parsed.stepResults.check, true);
+    assert.strictEqual(parsed.stepResults.ok, "channel");
   });
 });

@@ -73,4 +73,5 @@ export interface PersistenceConfig {
   stateParam: string;
   defaultState: Record<string, unknown>;
   updateFromStep?: string;
+  writeKeyFrom?: string;
 }

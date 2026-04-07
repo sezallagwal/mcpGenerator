@@ -47,7 +47,9 @@ export interface ComposerWarning {
     | "PARAM_SUBFIELD_UNKNOWN"
     | "SAMPLING_SCHEMA_MISMATCH"
     | "FIELD_STRIPPED"
-    | "FIELD_AUTO_SET";
+    | "FIELD_AUTO_SET"
+    | "OUTPUT_PATH_INFERRED"
+    | "OUTPUT_PATH_REF_FIXED";
   message: string;
 }
 
@@ -176,6 +178,66 @@ function normalizeStepFields(steps: ComposeStepInput[]): ComposerWarning[] {
   return warnings;
 }
 
+/** Infer missing thenStep from dependents (1 dependent → infer, 0 or 2+ → hard error). */
+function inferMissingConditionalTargets(
+  steps: ComposeStepInput[],
+): ComposerWarning[] {
+  const warnings: ComposerWarning[] = [];
+
+  for (const step of steps) {
+    if (step.config.type !== "conditional") continue;
+    const cfg = step.config as ConditionalStep;
+    if (cfg.thenStep) continue;
+
+    const dependents = steps.filter(
+      (s) => s.id !== step.id && s.dependsOn?.includes(step.id),
+    );
+
+    if (cfg.elseStep) {
+      const candidates = dependents.filter((s) => s.id !== cfg.elseStep);
+      if (candidates.length === 1) {
+        cfg.thenStep = candidates[0].id;
+        warnings.push({
+          stepId: step.id,
+          code: "FIELD_AUTO_SET",
+          message: `Auto-inferred thenStep="${cfg.thenStep}" for conditional "${step.id}" from its dependents.`,
+        });
+      } else if (candidates.length === 0) {
+        throw new ComposerError(
+          `Step "${step.id}" (conditional): thenStep is required. ` +
+            `Has elseStep="${cfg.elseStep}" but no other step depends on this conditional to infer thenStep from.`,
+        );
+      } else {
+        throw new ComposerError(
+          `Step "${step.id}" (conditional): thenStep is required. ` +
+            `Multiple steps depend on it [${candidates.map((s) => s.id).join(", ")}] — specify thenStep explicitly.`,
+        );
+      }
+    } else {
+      if (dependents.length === 1) {
+        cfg.thenStep = dependents[0].id;
+        warnings.push({
+          stepId: step.id,
+          code: "FIELD_AUTO_SET",
+          message: `Auto-inferred thenStep="${cfg.thenStep}" for conditional "${step.id}" from its dependents.`,
+        });
+      } else if (dependents.length === 0) {
+        throw new ComposerError(
+          `Step "${step.id}" (conditional): thenStep is required. ` +
+            `No steps depend on this conditional — cannot infer thenStep.`,
+        );
+      } else {
+        throw new ComposerError(
+          `Step "${step.id}" (conditional): thenStep is required. ` +
+            `Multiple steps depend on it [${dependents.map((s) => s.id).join(", ")}] — specify thenStep explicitly.`,
+        );
+      }
+    }
+  }
+
+  return warnings;
+}
+
 function validateStepConfig(step: ComposeStepInput): void {
   const cfg = step.config;
   switch (cfg.type) {
@@ -248,6 +310,7 @@ function validateStepConfig(step: ComposeStepInput): void {
 const STEP_REF_RE = /\{\{steps\.(\w+)/g;
 const PARAM_REF_RE = /\{\{params\.([\w.]+)/g;
 const BARE_STEP_REF_RE = /\bsteps\.(\w+)/g;
+const BARE_PARAM_REF_RE = /\bparams\.([\w]+(?:\.[\w]+)*)/g;
 const STEP_FIELD_ACCESS_RE = /steps\.(\w+)\.(\w+)/g;
 
 const JS_BUILTIN_METHODS = new Set([
@@ -443,6 +506,22 @@ function injectImplicitDependencies(
   return warnings;
 }
 
+/** Find domain key containing `field` as sub-property (e.g. "message" for "room"). */
+function findDomainKeyHint(field: string, params: JSONSchema7): string | null {
+  const props = params.properties as
+    | Record<string, JSONSchema7 | boolean>
+    | undefined;
+  if (!props) return null;
+  for (const [key, schema] of Object.entries(props)) {
+    if (typeof schema === "boolean") continue;
+    const subProps = schema.properties as Record<string, unknown> | undefined;
+    if (subProps && (field in subProps || `${field}?` in subProps)) {
+      return key;
+    }
+  }
+  return null;
+}
+
 function validateTemplateReferences(
   steps: ComposeStepInput[],
   params: JSONSchema7,
@@ -475,8 +554,12 @@ function validateTemplateReferences(
           const segments = fullPath.split(".");
           const topField = segments[0];
           if (!paramProps.has(topField)) {
+            const hint = findDomainKeyHint(topField, params);
             throw new ComposerError(
-              `Step "${step.id}" references "params.${topField}" but "${topField}" is not in the workflow params schema. Available: ${[...paramProps].join(", ") || "(none)"}`,
+              `Step "${step.id}" references "params.${topField}" but "${topField}" is not in the workflow params schema. Available: ${[...paramProps].join(", ") || "(none)"}` +
+                (hint
+                  ? `. Did you mean "params.${hint}.${topField}"? Event params are nested under the domain key.`
+                  : ""),
             );
           }
           if (segments.length > 1) {
@@ -487,6 +570,34 @@ function validateTemplateReferences(
               fullPath,
             );
             if (subWarning) warnings.push(subWarning);
+          }
+        }
+        const isJsContext =
+          step.config.type === "transform" ||
+          step.config.type === "conditional";
+        if (isJsContext) {
+          for (const match of tmpl.matchAll(BARE_PARAM_REF_RE)) {
+            const fullPath = match[1];
+            const segments = fullPath.split(".");
+            const topField = segments[0];
+            if (!paramProps.has(topField)) {
+              const hint = findDomainKeyHint(topField, params);
+              throw new ComposerError(
+                `Step "${step.id}" references "params.${topField}" but "${topField}" is not in the workflow params schema. Available: ${[...paramProps].join(", ") || "(none)"}` +
+                  (hint
+                    ? `. Did you mean "params.${hint}.${topField}"? Event params are nested under the domain key.`
+                    : ""),
+              );
+            }
+            if (segments.length > 1) {
+              const subWarning = validateParamSubField(
+                segments,
+                params,
+                step.id,
+                fullPath,
+              );
+              if (subWarning) warnings.push(subWarning);
+            }
           }
         }
       }
@@ -514,11 +625,9 @@ function validateParamSubField(
       const available = Object.keys(props);
       const parentPath =
         i === 0 ? "params" : `params.${segments.slice(0, i).join(".")}`;
-      return {
-        stepId,
-        code: "PARAM_SUBFIELD_UNKNOWN",
-        message: `Step "${stepId}" references "params.${fullPath}" but "${seg}" is not a known property of ${parentPath}. Available: ${available.join(", ")}`,
-      };
+      throw new ComposerError(
+        `Step "${stepId}" references "params.${fullPath}" but "${seg}" is not a known property of ${parentPath}. Available: ${available.join(", ")}`,
+      );
     }
     const next: JSONSchema7 | boolean = props[seg];
     if (typeof next === "boolean") return null;
@@ -578,11 +687,7 @@ function validateDataFlowTypes(steps: ComposeStepInput[]): void {
   }
 }
 
-/**
- * For each sampling step with responseFormat: "json", scan all downstream steps
- * for references like steps.<samplingId>.result.<field>. Infer a responseSchema
- * from those references — field names + rough types — and set it on the step config.
- */
+/** Auto-infer responseSchema for JSON sampling steps from downstream field-access patterns. */
 function inferSamplingResponseSchemas(
   steps: ComposeStepInput[],
 ): ComposerWarning[] {
@@ -620,7 +725,6 @@ function inferSamplingResponseSchemas(
         const fields = fieldAccesses.get(refId)!;
         if (fields.has(field)) continue; // first wins
 
-        // Infer type from context
         let inferredType = "string";
         if (boolLiteral === "true" || boolLiteral === "false") {
           inferredType = "boolean";
@@ -636,7 +740,6 @@ function inferSamplingResponseSchemas(
     }
   }
 
-  // Apply inferred schemas to the sampling step configs
   for (const [stepId, fields] of fieldAccesses) {
     if (fields.size === 0) continue;
     const step = steps.find((s) => s.id === stepId)!;
@@ -885,6 +988,156 @@ function topologicalSort(steps: ComposeStepInput[]): string[] {
   return order;
 }
 
+/** Auto-infer outputPath for api_call steps when all downstream refs access the same root field; also fix redundant double-extraction. */
+function inferOutputPath(steps: ComposeStepInput[]): ComposerWarning[] {
+  const warnings: ComposerWarning[] = [];
+  const apiCallSteps = new Map<string, ApiCallStep>();
+  for (const step of steps) {
+    if (step.config.type === "api_call") {
+      apiCallSteps.set(step.id, step.config as ApiCallStep);
+    }
+  }
+  if (apiCallSteps.size === 0) return warnings;
+
+  const fieldAccesses = new Map<string, Set<string>>();
+  for (const [id] of apiCallSteps) fieldAccesses.set(id, new Set());
+
+  for (const step of steps) {
+    const strings = extractTemplateStrings(step.config);
+    const isJs =
+      step.config.type === "transform" || step.config.type === "conditional";
+    for (const str of strings) {
+      for (const m of str.matchAll(/\{\{steps\.(\w+)\.(\w+)/g)) {
+        const [, stepId, field] = m;
+        if (fieldAccesses.has(stepId) && !JS_BUILTIN_METHODS.has(field)) {
+          fieldAccesses.get(stepId)!.add(field);
+        }
+      }
+      if (isJs) {
+        for (const m of str.matchAll(/\bsteps\.(\w+)\??\.(\w+)/g)) {
+          const [, stepId, field] = m;
+          if (fieldAccesses.has(stepId) && !JS_BUILTIN_METHODS.has(field)) {
+            fieldAccesses.get(stepId)!.add(field);
+          }
+        }
+      }
+    }
+  }
+
+  for (const [stepId, apiCfg] of apiCallSteps) {
+    const accessed = fieldAccesses.get(stepId)!;
+    if (accessed.size === 0) continue;
+
+    if (apiCfg.outputPath) {
+      if (accessed.has(apiCfg.outputPath)) {
+        rewriteStepRefs(steps, stepId, apiCfg.outputPath);
+        warnings.push({
+          stepId,
+          code: "OUTPUT_PATH_REF_FIXED",
+          message:
+            `Redundant extraction fixed: downstream refs used "steps.${stepId}.${apiCfg.outputPath}" ` +
+            `but outputPath already extracts "${apiCfg.outputPath}". Refs rewritten to "steps.${stepId}".`,
+        });
+      }
+    } else if (accessed.size === 1) {
+      const field = [...accessed][0];
+      apiCfg.outputPath = field;
+      rewriteStepRefs(steps, stepId, field);
+      warnings.push({
+        stepId,
+        code: "OUTPUT_PATH_INFERRED",
+        message:
+          `Auto-inferred outputPath "${field}": all downstream refs access "steps.${stepId}.${field}". ` +
+          `Refs rewritten to "steps.${stepId}".`,
+      });
+    }
+  }
+
+  return warnings;
+}
+
+/** Strip extracted outputPath field from downstream step refs (template + JS + optional chaining). */
+function rewriteStepRefs(
+  steps: ComposeStepInput[],
+  stepId: string,
+  field: string,
+): void {
+  const tmplRe = new RegExp(
+    `(\\{\\{steps\\.${stepId})\\.${field}(?=\\.|\\}|\\s|\\))`,
+    "g",
+  );
+  const jsRe = new RegExp(
+    `(\\bsteps\\.${stepId})\\??\\.${field}(?=\\??\\.|\\b|\\)|\\s|$|,|;|\\])`,
+    "g",
+  );
+
+  for (const step of steps) {
+    const cfg = step.config;
+    const isJs = cfg.type === "transform" || cfg.type === "conditional";
+    const activeRe = isJs ? jsRe : tmplRe;
+
+    switch (cfg.type) {
+      case "api_call": {
+        const apiCfg = cfg as ApiCallStep;
+        if (apiCfg.inputMapping) {
+          apiCfg.inputMapping = rewriteDeep(
+            apiCfg.inputMapping,
+            tmplRe,
+          ) as Record<string, unknown>;
+        }
+        if (apiCfg.forEach) {
+          apiCfg.forEach = apiCfg.forEach.replace(tmplRe, "$1");
+        }
+        break;
+      }
+      case "sampling": {
+        const sCfg = cfg as SamplingStep;
+        sCfg.prompt = sCfg.prompt.replace(tmplRe, "$1");
+        if (sCfg.systemPrompt)
+          sCfg.systemPrompt = sCfg.systemPrompt.replace(tmplRe, "$1");
+        if (sCfg.content) {
+          for (const item of sCfg.content) {
+            if (item.type === "text")
+              item.text = item.text.replace(tmplRe, "$1");
+          }
+        }
+        break;
+      }
+      case "elicitation": {
+        const eCfg = cfg as ElicitationStep;
+        eCfg.message = eCfg.message.replace(tmplRe, "$1");
+        break;
+      }
+      case "transform": {
+        const tCfg = cfg as TransformStep;
+        tCfg.expression = tCfg.expression.replace(jsRe, "$1");
+        tCfg.expression = tCfg.expression.replace(tmplRe, "$1");
+        break;
+      }
+      case "conditional": {
+        const cCfg = cfg as ConditionalStep;
+        cCfg.condition = cCfg.condition.replace(jsRe, "$1");
+        cCfg.condition = cCfg.condition.replace(tmplRe, "$1");
+        break;
+      }
+    }
+  }
+}
+
+/** Recursively replace in all string values of an object/array. */
+function rewriteDeep(value: unknown, re: RegExp): unknown {
+  if (typeof value === "string") return value.replace(re, "$1");
+  if (Array.isArray(value)) return value.map((item) => rewriteDeep(item, re));
+  if (typeof value === "object" && value !== null) {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      result[k] = rewriteDeep(v, re);
+    }
+    return result;
+  }
+  return value;
+}
+
 function validatePersistenceConfig(
   persistence: PersistenceConfig,
   steps: ComposeStepInput[],
@@ -897,6 +1150,19 @@ function validatePersistenceConfig(
       'Persistence keyPath is required (e.g. "sender.username" for per-user state)',
     );
   }
+
+  // Strip "params." prefix — keyPath is domain-relative ("room.id"), not engine-scoped ("params.room.id")
+  let normalizedKeyPath = persistence.keyPath.trim();
+  if (normalizedKeyPath.startsWith("params.")) {
+    normalizedKeyPath = normalizedKeyPath.slice(7);
+  }
+  if (!/^[a-zA-Z_$]\w*(?:\.[a-zA-Z_$]\w*)*$/.test(normalizedKeyPath)) {
+    throw new ComposerError(
+      `Persistence keyPath "${persistence.keyPath}" is not a valid dotted property path ` +
+        `(e.g. "room.id", "sender.username")`,
+    );
+  }
+  persistence.keyPath = normalizedKeyPath;
 
   if (
     !persistence.stateParam ||
@@ -916,13 +1182,70 @@ function validatePersistenceConfig(
     }
     const updateStep = steps.find((s) => s.id === persistence.updateFromStep);
     if (updateStep && updateStep.config.type !== "transform") {
-      warnings.push({
-        stepId: persistence.updateFromStep,
-        code: "DATA_FLOW_WARNING",
-        message:
-          `Persistence updateFromStep "${persistence.updateFromStep}" is a ${updateStep.config.type} step. ` +
-          `Consider using a transform step to produce a structured state object.`,
-      });
+      throw new ComposerError(
+        `Persistence updateFromStep "${persistence.updateFromStep}" is a ${updateStep.config.type} step — ` +
+          `MUST be a transform step. Transform steps produce structured state objects; ` +
+          `${updateStep.config.type} steps do not.`,
+      );
+    }
+  }
+
+  // Warn if stateParam is declared but never referenced in any step template
+  const stateRef = `params.${persistence.stateParam}`;
+  let stateParamUsed = false;
+  for (const step of steps) {
+    const cfg = step.config as Record<string, unknown>;
+    const templates: string[] = [];
+    if (cfg.inputMapping && typeof cfg.inputMapping === "object") {
+      for (const v of Object.values(
+        cfg.inputMapping as Record<string, unknown>,
+      )) {
+        if (typeof v === "string") templates.push(v);
+      }
+    }
+    for (const field of [
+      "prompt",
+      "systemPrompt",
+      "expression",
+      "condition",
+      "message",
+    ]) {
+      if (typeof cfg[field] === "string") templates.push(cfg[field] as string);
+    }
+    if (templates.some((t) => t.includes(stateRef))) {
+      stateParamUsed = true;
+      break;
+    }
+  }
+  if (!stateParamUsed) {
+    warnings.push({
+      stepId: null,
+      code: "DATA_FLOW_WARNING",
+      message:
+        `Persistence stateParam "${persistence.stateParam}" is declared but never referenced in any step. ` +
+        `The loaded state is injected as params.${persistence.stateParam} — use it or remove persistence config.`,
+    });
+  }
+
+  if (persistence.writeKeyFrom) {
+    if (!persistence.updateFromStep) {
+      throw new ComposerError(
+        `Persistence writeKeyFrom "${persistence.writeKeyFrom}" requires updateFromStep to be set — ` +
+          `the write key is extracted from the updateFromStep result.`,
+      );
+    }
+    const parts = persistence.writeKeyFrom.split(".");
+    if (parts.length < 2) {
+      throw new ComposerError(
+        `Persistence writeKeyFrom "${persistence.writeKeyFrom}" must be "<stepId>.<field>" ` +
+          `(e.g. "${persistence.updateFromStep}.channelId").`,
+      );
+    }
+    if (parts[0] !== persistence.updateFromStep) {
+      throw new ComposerError(
+        `Persistence writeKeyFrom "${persistence.writeKeyFrom}" must reference the updateFromStep ` +
+          `"${persistence.updateFromStep}" (got "${parts[0]}").`,
+      );
     }
   }
 
@@ -957,7 +1280,7 @@ function normalizeEventParamShorthand(
     .filter((name) => !forEachAsVars.has(name))
     .map((name) => ({
       name,
-      re: new RegExp(`(?<!params\\.)\\b${name}\\.`, "g"),
+      re: new RegExp(`(?<!\\.)\\b${name}\\.`, "g"),
       replacement: `params.${name}.`,
     }));
 
@@ -1031,25 +1354,23 @@ function normalizeEventParamShorthand(
   function rewriteJs(stepId: string, value: string, fieldName: string): string {
     let result = value;
     for (const rule of jsRewriters) {
-      const rewritten = result.replace(rule.re, rule.replacement);
-      if (rewritten !== result) {
+      if (rule.re.test(result)) {
         warnings.push({
           stepId,
-          code: "EVENT_PARAM_REWRITTEN",
-          message: `Rewritten event param shorthand in ${fieldName}: "${rule.name}." → "params.${rule.name}."`,
+          code: "EVENT_PARAM_SHORTHAND",
+          message: `Bare param "${rule.name}." in ${fieldName} — both "${rule.name}.x" and "params.${rule.name}.x" work at runtime`,
         });
-        result = rewritten;
+        rule.re.lastIndex = 0;
       }
     }
     for (const rule of subFieldRewriters) {
-      const rewritten = result.replace(rule.jsRe, rule.jsReplacement);
-      if (rewritten !== result) {
+      if (rule.jsRe.test(result)) {
         warnings.push({
           stepId,
-          code: "EVENT_PARAM_REWRITTEN",
-          message: `Rewritten sub-field shorthand in ${fieldName}: "params.${rule.subField}." → "params.${rule.parent}.${rule.subField}."`,
+          code: "EVENT_PARAM_SHORTHAND",
+          message: `Bare sub-field "params.${rule.subField}." in ${fieldName} — both "params.${rule.subField}.x" and "params.${rule.parent}.${rule.subField}.x" work at runtime`,
         });
-        result = rewritten;
+        rule.jsRe.lastIndex = 0;
       }
     }
     return result;
@@ -1131,9 +1452,7 @@ function normalizeEventParamShorthand(
   return warnings;
 }
 
-/**
- * Escape a string literal for use inside double-quoted JS strings.
- */
+/** Escape for double-quoted JS string literals. */
 function escapeStringLiteral(s: string): string {
   return s
     .replace(/\\/g, "\\\\")
@@ -1143,11 +1462,7 @@ function escapeStringLiteral(s: string): string {
     .replace(/\t/g, "\\t");
 }
 
-/**
- * Convert Handlebars-style block helpers to JS expressions.
- * Supports {{#each collection}}...{{/each}} and {{#if cond}}...{{else}}...{{/if}}.
- * Throws ComposerError for unsupported or nested blocks.
- */
+/** Convert {{#each}}/{{#if}} Handlebars blocks to JS expressions; throws on unsupported/nested blocks. */
 function convertHandlebarsBlocks(
   input: string,
   stepId: string,
@@ -1295,10 +1610,13 @@ function normalizeTemplateFields(steps: ComposeStepInput[]): ComposerWarning[] {
     value: string,
     fieldName: string,
   ): string {
+    // Collapse \n / \\n / \\\n → real newline (LLMs often multi-escape in JSON tool args)
+    let result = value.replace(/\\+n/g, "\n").replace(/\\+t/g, "\t");
+
     // First: convert any Handlebars block syntax to JS expressions
-    let result = /\{\{#/.test(value)
-      ? convertHandlebarsBlocks(value, stepId, fieldName, warnings)
-      : value;
+    result = /\{\{#/.test(result)
+      ? convertHandlebarsBlocks(result, stepId, fieldName, warnings)
+      : result;
 
     if (/^(steps|params)\.\w+(\.\w+)*$/.test(result)) {
       const wrapped = `{{${result}}}`;
@@ -1544,6 +1862,7 @@ export function composeWorkflowDefinition(
   const flattenWarnings = flattenNestedSteps(steps);
   validateUniqueIds(steps);
   const fieldNormWarnings = normalizeStepFields(steps);
+  const conditionalInferWarnings = inferMissingConditionalTargets(steps);
   for (const step of steps) {
     validateStepConfig(step);
   }
@@ -1556,7 +1875,53 @@ export function composeWorkflowDefinition(
 
   const implicitDepWarnings = injectImplicitDependencies(steps);
 
+  const outputPathWarnings = inferOutputPath(steps);
+
   detectCycles(steps);
+
+  // Reject event-domain refs (params.message.*, params.context.*) in command workflows with no triggerEvent
+  if (!triggerEvent) {
+    const paramProps = params.properties
+      ? new Set(Object.keys(params.properties))
+      : new Set<string>();
+    const eventOnlyDomains: Array<[string, string]> = [
+      ["message", "params.message."],
+      ["context", "params.context."],
+    ];
+    for (const [domain, prefix] of eventOnlyDomains) {
+      if (paramProps.has(domain)) continue;
+      for (const step of steps) {
+        const cfg = step.config as Record<string, unknown>;
+        const templates: string[] = [];
+        if (cfg.inputMapping && typeof cfg.inputMapping === "object") {
+          for (const v of Object.values(
+            cfg.inputMapping as Record<string, unknown>,
+          )) {
+            if (typeof v === "string") templates.push(v);
+          }
+        }
+        for (const field of [
+          "prompt",
+          "systemPrompt",
+          "expression",
+          "condition",
+          "message",
+        ]) {
+          if (typeof cfg[field] === "string")
+            templates.push(cfg[field] as string);
+        }
+        for (const tmpl of templates) {
+          if (tmpl.includes(prefix)) {
+            throw new ComposerError(
+              `Step "${step.id}" references "${prefix}*" but no triggerEvent is set. ` +
+                `Add triggerEvent (e.g. IPostMessageSent) or use command params ` +
+                `(params.room, params.sender, params.query).`,
+            );
+          }
+        }
+      }
+    }
+  }
 
   const templateRefWarnings = validateTemplateReferences(steps, params);
 
@@ -1573,9 +1938,11 @@ export function composeWorkflowDefinition(
   const allWarnings = [
     ...flattenWarnings,
     ...fieldNormWarnings,
+    ...conditionalInferWarnings,
     ...eventParamWarnings,
     ...normalizationWarnings,
     ...implicitDepWarnings,
+    ...outputPathWarnings,
     ...templateRefWarnings,
     ...samplingSchemaWarnings,
     ...semanticWarnings,

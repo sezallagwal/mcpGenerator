@@ -1197,47 +1197,41 @@ describe("C3: Template Reference Validation", () => {
   });
 
   it("warns on invalid sub-field of object param", () => {
-    const result = composeWorkflowDefinition({
-      name: "test_bad_subfield",
-      description: "Test invalid sub-field",
-      params: {
-        type: "object",
-        properties: {
-          room: {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_bad_subfield",
+          description: "Test invalid sub-field",
+          params: {
             type: "object",
             properties: {
-              id: { type: "string" },
-              type: { type: "string" },
-              displayName: { type: "string" },
+              room: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  type: { type: "string" },
+                  displayName: { type: "string" },
+                },
+              },
+              query: { type: "string" },
             },
           },
-          query: { type: "string" },
-        },
-      },
-      steps: [
-        {
-          id: "send",
-          label: "Send",
-          config: {
-            type: "api_call",
-            operationId: "post-api-v1-chat-sendmessage",
-            inputMapping: { roomId: "{{params.room.nonexistent}}" },
-          },
-        },
-      ],
-    });
-    assert.ok(
-      result.warnings.some((w) => w.code === "PARAM_SUBFIELD_UNKNOWN"),
-      "Should warn on unknown sub-field",
-    );
-    assert.ok(
-      result.warnings.some(
-        (w) =>
-          w.code === "PARAM_SUBFIELD_UNKNOWN" &&
-          w.message.includes("nonexistent") &&
-          w.message.includes("id, type, displayName"),
-      ),
-      "Warning should mention the invalid field and available fields",
+          steps: [
+            {
+              id: "send",
+              label: "Send",
+              config: {
+                type: "api_call",
+                operationId: "post-api-v1-chat-sendmessage",
+                inputMapping: { roomId: "{{params.room.nonexistent}}" },
+              },
+            },
+          ],
+        }),
+      (err: any) =>
+        err.message.includes("nonexistent") &&
+        err.message.includes("id, type, displayName"),
+      "Should throw on unknown sub-field listing available properties",
     );
   });
 
@@ -2078,6 +2072,132 @@ describe("inputMapping validation", () => {
   });
 });
 
+describe("Orphaned event param detection", () => {
+  it("throws when params.message.* used without triggerEvent", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_orphan_event",
+          description: "Test orphaned event params",
+          params: {
+            type: "object",
+            properties: { room: { type: "object" } },
+          },
+          steps: [
+            {
+              id: "send_reply",
+              label: "Send Reply",
+              config: {
+                type: "api_call",
+                operationId: "post-api-v1-chat-sendmessage",
+                inputMapping: {
+                  roomId: "{{params.message.room.id}}",
+                  text: "Got it",
+                },
+              },
+            },
+          ],
+        }),
+      /params\.message\.\*.*no triggerEvent/,
+    );
+  });
+
+  it("allows params.message.* when triggerEvent is set", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_event_ok",
+      description: "Test event params with trigger",
+      triggerEvent: "IPostMessageSent",
+      params: {
+        type: "object",
+        properties: {
+          message: {
+            type: "object",
+            properties: {
+              room: { type: "object", properties: { id: { type: "string" } } },
+              text: { type: "string" },
+            },
+          },
+        },
+      },
+      steps: [
+        {
+          id: "send_reply",
+          label: "Send Reply",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat-sendmessage",
+            inputMapping: {
+              roomId: "{{params.message.room.id}}",
+              text: "Got it",
+            },
+          },
+        },
+      ],
+    });
+    assert.ok(result.workflow);
+  });
+
+  it("allows params.room.* in command workflows (not event-only)", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_cmd_room",
+      description: "Test command room param",
+      params: {
+        type: "object",
+        properties: {
+          room: {
+            type: "object",
+            properties: { id: { type: "string" } },
+          },
+        },
+      },
+      steps: [
+        {
+          id: "send_msg",
+          label: "Send Message",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat-sendmessage",
+            inputMapping: {
+              roomId: "{{params.room.id}}",
+              text: "hello",
+            },
+          },
+        },
+      ],
+    });
+    assert.ok(result.workflow);
+  });
+
+  it("throws when params.context.* used without triggerEvent", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_orphan_context",
+          description: "Test orphaned context params",
+          params: {
+            type: "object",
+            properties: { room: { type: "object" } },
+          },
+          steps: [
+            {
+              id: "greet",
+              label: "Greet",
+              config: {
+                type: "api_call",
+                operationId: "post-api-v1-chat-sendmessage",
+                inputMapping: {
+                  roomId: "R1",
+                  text: "Welcome {{params.context.joiner.username}}",
+                },
+              },
+            },
+          ],
+        }),
+      /params\.context\.\*.*no triggerEvent/,
+    );
+  });
+});
+
 describe("Persistence validation", () => {
   it("passes persistence config through to workflow definition", () => {
     const result = composeWorkflowDefinition({
@@ -2207,38 +2327,235 @@ describe("Persistence validation", () => {
     );
   });
 
-  it("warns when updateFromStep is not a transform step", () => {
+  it("normalizes keyPath by stripping params. prefix", () => {
     const result = composeWorkflowDefinition({
-      name: "test_warn_persist",
-      description: "Test warn",
-      params: { type: "object", properties: {} },
+      name: "test_normalize_key",
+      description: "Test keyPath normalization",
+      params: {
+        type: "object",
+        properties: { text: { type: "string" } },
+      },
       steps: [
         {
           id: "analyze",
           label: "Analyze",
-          config: {
-            type: "sampling",
-            prompt: "test",
-          },
+          config: { type: "sampling", prompt: "test: {{params.text}}" },
+        },
+        {
+          id: "update_state",
+          label: "Update",
+          config: { type: "transform", expression: "({ count: 1 })" },
+          dependsOn: ["analyze"],
+        },
+      ],
+      persistence: {
+        model: "room",
+        keyPath: "params.room.id",
+        stateParam: "roomState",
+        defaultState: { count: 0 },
+        updateFromStep: "update_state",
+      },
+    });
+
+    assert.equal(
+      result.workflow.persistence!.keyPath,
+      "room.id",
+      "params. prefix should be stripped",
+    );
+  });
+
+  it("leaves keyPath unchanged when it has no params. prefix", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_no_strip",
+      description: "Test keyPath no-strip",
+      params: {
+        type: "object",
+        properties: { text: { type: "string" } },
+      },
+      steps: [
+        {
+          id: "analyze",
+          label: "Analyze",
+          config: { type: "sampling", prompt: "test: {{params.text}}" },
+        },
+        {
+          id: "update_state",
+          label: "Update",
+          config: { type: "transform", expression: "({ count: 1 })" },
+          dependsOn: ["analyze"],
         },
       ],
       persistence: {
         model: "user",
         keyPath: "sender.username",
         stateParam: "userState",
-        defaultState: {},
-        updateFromStep: "analyze",
+        defaultState: { count: 0 },
+        updateFromStep: "update_state",
+      },
+    });
+
+    assert.equal(
+      result.workflow.persistence!.keyPath,
+      "sender.username",
+      "keyPath without params. prefix should stay unchanged",
+    );
+  });
+
+  it("throws when keyPath is not a valid dotted property path", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_bad_key_format",
+          description: "Test bad keyPath format",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "analyze",
+              label: "Analyze",
+              config: { type: "sampling", prompt: "test" },
+            },
+          ],
+          persistence: {
+            model: "user",
+            keyPath: "room['id']",
+            stateParam: "state",
+            defaultState: {},
+          },
+        }),
+      /not a valid dotted property path/i,
+    );
+  });
+
+  it("throws when updateFromStep is not a transform step", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_warn_persist",
+          description: "Test warn",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "analyze",
+              label: "Analyze",
+              config: {
+                type: "sampling",
+                prompt: "test",
+              },
+            },
+          ],
+          persistence: {
+            model: "user",
+            keyPath: "sender.username",
+            stateParam: "userState",
+            defaultState: {},
+            updateFromStep: "analyze",
+          },
+        }),
+      /MUST be a transform step/,
+    );
+  });
+
+  it("throws when updateFromStep points to api_call step", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_apicall_persist",
+          description: "Test api_call persistence",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "fetch_data",
+              label: "Fetch Data",
+              config: {
+                type: "api_call",
+                operationId: "get-api-v1-channels-list",
+                inputMapping: {},
+              },
+            },
+          ],
+          persistence: {
+            model: "room",
+            keyPath: "room.id",
+            stateParam: "roomState",
+            defaultState: {},
+            updateFromStep: "fetch_data",
+          },
+        }),
+      /MUST be a transform step/,
+    );
+  });
+
+  it("warns when stateParam is declared but never referenced", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_unused_state",
+      description: "Test unused stateParam",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "send_msg",
+          label: "Send Message",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat-sendmessage",
+            inputMapping: { roomId: "R1", text: "hello" },
+          },
+        },
+      ],
+      persistence: {
+        model: "user",
+        keyPath: "sender.username",
+        stateParam: "myState",
+        defaultState: { count: 0 },
       },
     });
 
     assert.ok(
       result.warnings.some(
         (w) =>
-          w.stepId === "analyze" &&
-          w.message.includes("sampling") &&
-          w.message.includes("transform"),
+          w.code === "DATA_FLOW_WARNING" &&
+          w.message.includes("myState") &&
+          w.message.includes("never referenced"),
       ),
-      "Should warn about non-transform updateFromStep",
+      "Should warn about unused stateParam",
+    );
+  });
+
+  it("does not warn when stateParam is referenced in step templates", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_used_state",
+      description: "Test used stateParam",
+      params: {
+        type: "object",
+        properties: { myState: { type: "object" } },
+      },
+      steps: [
+        {
+          id: "update_state",
+          label: "Update State",
+          config: {
+            type: "transform",
+            expression: "({ count: (params.myState?.count || 0) + 1 })",
+          },
+        },
+      ],
+      persistence: {
+        model: "user",
+        keyPath: "sender.username",
+        stateParam: "myState",
+        defaultState: { count: 0 },
+        updateFromStep: "update_state",
+      },
+    });
+
+    const unusedWarning = result.warnings.find(
+      (w) =>
+        w.code === "DATA_FLOW_WARNING" &&
+        w.message.includes("never referenced"),
+    );
+    assert.equal(
+      unusedWarning,
+      undefined,
+      "Should not warn when stateParam is referenced",
     );
   });
 
@@ -2261,6 +2578,134 @@ describe("Persistence validation", () => {
     });
 
     assert.equal(result.workflow.persistence, undefined);
+  });
+
+  it("passes writeKeyFrom through to workflow definition", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_write_key",
+      description: "Test writeKeyFrom",
+      params: {
+        type: "object",
+        properties: { text: { type: "string" } },
+      },
+      steps: [
+        {
+          id: "analyze",
+          label: "Analyze",
+          config: { type: "sampling", prompt: "Analyze: {{params.text}}" },
+        },
+        {
+          id: "update_state",
+          label: "Update state",
+          config: { type: "transform", expression: "({ channelId: 'abc' })" },
+          dependsOn: ["analyze"],
+        },
+      ],
+      persistence: {
+        model: "room",
+        keyPath: "room.id",
+        stateParam: "incidentState",
+        defaultState: { active: false },
+        updateFromStep: "update_state",
+        writeKeyFrom: "update_state.channelId",
+      },
+    });
+
+    assert.ok(result.workflow.persistence);
+    assert.equal(
+      result.workflow.persistence!.writeKeyFrom,
+      "update_state.channelId",
+    );
+  });
+
+  it("throws when writeKeyFrom is set without updateFromStep", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_write_key_no_update",
+          description: "Test writeKeyFrom without updateFromStep",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "analyze",
+              label: "Analyze",
+              config: { type: "sampling", prompt: "test" },
+            },
+          ],
+          persistence: {
+            model: "room",
+            keyPath: "room.id",
+            stateParam: "state",
+            defaultState: {},
+            writeKeyFrom: "analyze.field",
+          },
+        }),
+      /writeKeyFrom.*requires updateFromStep/,
+    );
+  });
+
+  it("throws when writeKeyFrom has no field path (just stepId)", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_write_key_no_field",
+          description: "Test writeKeyFrom without field",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "update_state",
+              label: "Update",
+              config: { type: "transform", expression: "({ x: 1 })" },
+            },
+          ],
+          persistence: {
+            model: "room",
+            keyPath: "room.id",
+            stateParam: "state",
+            defaultState: {},
+            updateFromStep: "update_state",
+            writeKeyFrom: "update_state",
+          },
+        }),
+      /must be.*stepId.*field/i,
+    );
+  });
+
+  it("throws when writeKeyFrom references a different step than updateFromStep", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_write_key_wrong_step",
+          description: "Test writeKeyFrom wrong step",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "fetch",
+              label: "Fetch",
+              config: {
+                type: "api_call",
+                operationId: "get-api-v1-channels-list",
+                inputMapping: {},
+              },
+            },
+            {
+              id: "update_state",
+              label: "Update",
+              config: { type: "transform", expression: "({ x: 1 })" },
+              dependsOn: ["fetch"],
+            },
+          ],
+          persistence: {
+            model: "room",
+            keyPath: "room.id",
+            stateParam: "state",
+            defaultState: {},
+            updateFromStep: "update_state",
+            writeKeyFrom: "fetch.channelId",
+          },
+        }),
+      /must reference the updateFromStep/,
+    );
   });
 });
 
@@ -2567,10 +3012,12 @@ describe("template normalization", () => {
     });
     const sendStep = result.workflow.steps.find((s) => s.id === "send")!;
     const mapping = (sendStep.config as any).inputMapping;
+    // After .result stripping: {{steps.fetch.channel._id}}
+    // After inferOutputPath: outputPath="channel" inferred, ref rewritten to {{steps.fetch._id}}
     assert.equal(
       mapping.rid,
-      "{{steps.fetch.channel._id}}",
-      "Bare ref should be auto-wrapped",
+      "{{steps.fetch._id}}",
+      "Bare ref should be auto-wrapped and outputPath-rewritten",
     );
     assert.ok(
       result.warnings.some((w) => w.code === "TEMPLATE_AUTO_WRAPPED"),
@@ -2634,10 +3081,12 @@ describe("template normalization", () => {
       ],
     });
     const iterStep = result.workflow.steps.find((s) => s.id === "iter")!;
+    // After .result stripping + auto-wrap: {{steps.list.channels}}
+    // After inferOutputPath: outputPath="channels" inferred, ref rewritten to {{steps.list}}
     assert.equal(
       (iterStep.config as any).forEach,
-      "{{steps.list.channels}}",
-      "forEach bare ref should be auto-wrapped",
+      "{{steps.list}}",
+      "forEach bare ref should be auto-wrapped and outputPath-rewritten",
     );
   });
 
@@ -2771,10 +3220,12 @@ describe("template normalization", () => {
       ],
     });
     const xStep = result.workflow.steps.find((s) => s.id === "transform")!;
+    // After .result stripping: steps.fetch.channels.length
+    // After inferOutputPath: outputPath="channels" inferred, ref rewritten to steps.fetch.length
     assert.equal(
       (xStep.config as any).expression,
-      "steps.fetch.channels.length",
-      "Transform expressions should have .result auto-stripped",
+      "steps.fetch.length",
+      "Transform expressions should have .result stripped and outputPath-rewritten",
     );
   });
 });
@@ -2913,7 +3364,7 @@ describe("event param shorthand normalization", () => {
     assert.equal(mapping.text, "Hello {{params.context.user.name}}!");
   });
 
-  it("rewrites context.X to params.context.X in conditional conditions", () => {
+  it("keeps bare context.X in conditional conditions (warns only)", () => {
     const result = composeWorkflowDefinition({
       name: "test_condition_rewrite",
       description: "Test condition rewrite",
@@ -2943,9 +3394,15 @@ describe("event param shorthand normalization", () => {
       ],
     });
     const condStep = result.workflow.steps.find((s) => s.id === "check_admin")!;
+    // JS rewriter is now warning-only: condition stays unchanged
     assert.equal(
       (condStep.config as any).condition,
-      "params.context.user.roles.includes('admin')",
+      "context.user.roles.includes('admin')",
+    );
+    // Should emit a shorthand warning
+    assert.ok(
+      result.warnings.some((w) => w.code === "EVENT_PARAM_SHORTHAND"),
+      "should emit EVENT_PARAM_SHORTHAND warning",
     );
   });
 
@@ -3062,7 +3519,7 @@ describe("event param shorthand normalization", () => {
     assert.equal(mapping.text, "Echo: {{params.message.text}}");
   });
 
-  it("rewrites transform expressions", () => {
+  it("keeps bare context.X in transform expressions (warns only)", () => {
     const result = composeWorkflowDefinition({
       name: "test_transform_rewrite",
       description: "Test transform rewrite",
@@ -3096,9 +3553,14 @@ describe("event param shorthand normalization", () => {
     const transformStep = result.workflow.steps.find(
       (s) => s.id === "get_roles",
     )!;
+    // JS rewriter is now warning-only: expression stays unchanged
     assert.equal(
       (transformStep.config as any).expression,
-      "params.context.user.roles.join(', ')",
+      "context.user.roles.join(', ')",
+    );
+    assert.ok(
+      result.warnings.some((w) => w.code === "EVENT_PARAM_SHORTHAND"),
+      "should emit EVENT_PARAM_SHORTHAND warning",
     );
   });
 
@@ -3142,7 +3604,11 @@ describe("event param shorthand normalization", () => {
     );
   });
 
-  it("rewrites params.user.X to params.context.user.X in JS conditions", () => {
+  it("warns for params.user.X sub-field shorthand in JS conditions", () => {
+    // With the JS rewriter now warning-only, params.user.X stays as-is.
+    // But validation catches params.user as an unknown param.
+    // The correct way is to use params.context.user.X or bare context.user.X.
+    // We test that using the correct bare form works and emits a shorthand warning.
     const result = composeWorkflowDefinition({
       name: "test_subfield_js_rewrite",
       description: "Test sub-field JS rewrite",
@@ -3172,7 +3638,7 @@ describe("event param shorthand normalization", () => {
           label: "Check role",
           config: {
             type: "conditional",
-            condition: "params.user.roles.includes('admin')",
+            condition: "context.user.roles.includes('admin')",
             thenStep: "action",
           },
         },
@@ -3181,7 +3647,11 @@ describe("event param shorthand normalization", () => {
     const condStep = result.workflow.steps.find((s) => s.id === "check_role")!;
     assert.equal(
       (condStep.config as any).condition,
-      "params.context.user.roles.includes('admin')",
+      "context.user.roles.includes('admin')",
+    );
+    assert.ok(
+      result.warnings.some((w) => w.code === "EVENT_PARAM_SHORTHAND"),
+      "should emit EVENT_PARAM_SHORTHAND warning",
     );
   });
 
@@ -3256,6 +3726,101 @@ describe("event param shorthand normalization", () => {
     const mapping = (step.config as any).inputMapping;
     assert.equal(mapping.channel, "@{{params.user.username}}");
     assert.equal(mapping.text, "{{params.context.user.name}}");
+  });
+
+  it("does NOT corrupt step result property chains containing param names", () => {
+    // With scope injection (Approach 5), the JS rewriter no longer mutates
+    // conditions/transforms. Both bare `room.id` and `params.room.id` work
+    // at runtime because buildJsScope injects params as bare identifiers.
+    const result = composeWorkflowDefinition({
+      name: "test_no_step_corruption",
+      description: "Ensure step result property chains are not corrupted",
+      params: {
+        type: "object",
+        properties: {
+          room: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              displayName: { type: "string" },
+            },
+          },
+          sender: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              username: { type: "string" },
+            },
+          },
+          query: { type: "string" },
+        },
+      },
+      steps: [
+        {
+          id: "get_room_info",
+          label: "Get Room Info",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-rooms_info",
+            inputMapping: { roomId: "{{params.room.id}}" },
+          },
+        },
+        {
+          id: "check_room",
+          label: "Check Room",
+          config: {
+            type: "conditional",
+            condition:
+              "room.id !== '' && steps.get_room_info.room.name.startsWith('inc-')",
+            thenStep: "build_state",
+          },
+        },
+        {
+          id: "build_state",
+          label: "Build State",
+          config: {
+            type: "transform",
+            expression:
+              "({ user: sender.username, roomType: steps.get_room_info.room.type })",
+          },
+        },
+      ],
+    });
+
+    const condStep = result.workflow.steps.find((s) => s.id === "check_room")!;
+    const condition = (condStep.config as any).condition;
+    // JS rewriter is now warning-only: bare room.id stays as-is
+    assert.ok(
+      condition.includes("room.id"),
+      `bare room.id should remain unchanged: ${condition}`,
+    );
+    // steps.get_room_info.room.name → after inferOutputPath (outputPath="room" inferred):
+    // steps.get_room_info.name
+    assert.ok(
+      condition.includes("steps.get_room_info.name"),
+      `step property chain should be rewritten by outputPath inference: ${condition}`,
+    );
+
+    const transformStep = result.workflow.steps.find(
+      (s) => s.id === "build_state",
+    )!;
+    const expr = (transformStep.config as any).expression;
+    // bare sender.username stays as-is
+    assert.ok(
+      expr.includes("sender.username"),
+      `bare sender.username should remain unchanged: ${expr}`,
+    );
+    // steps.get_room_info.room.type → after inferOutputPath: steps.get_room_info.type
+    assert.ok(
+      expr.includes("steps.get_room_info.type"),
+      `step property chain should be rewritten by outputPath inference: ${expr}`,
+    );
+
+    // Should emit EVENT_PARAM_SHORTHAND warnings (not REWRITTEN)
+    assert.ok(
+      result.warnings.some((w) => w.code === "EVENT_PARAM_SHORTHAND"),
+      `should emit EVENT_PARAM_SHORTHAND warning`,
+    );
   });
 });
 
@@ -3951,6 +4516,224 @@ describe("Handlebars auto-conversion", () => {
   });
 });
 
+// ── Fix D: Newline/tab normalization (single + double escaping) ─────────
+
+describe("Newline/tab normalization", () => {
+  it("normalizes single-escaped \\n to real newline in inputMapping", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_newline_single",
+      description: "Test single escape",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "post",
+          label: "Post",
+          config: {
+            type: "api_call" as const,
+            operationId: "post-api-v1-chat_postMessage",
+            inputMapping: {
+              text: "line1\\nline2",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "post")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.strictEqual(
+      mapping.text,
+      "line1\nline2",
+      "Single-escaped \\n should become real newline",
+    );
+  });
+
+  it("normalizes double-escaped \\\\n to real newline in inputMapping", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_newline_double",
+      description: "Test double escape",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "post",
+          label: "Post",
+          config: {
+            type: "api_call" as const,
+            operationId: "post-api-v1-chat_postMessage",
+            inputMapping: {
+              text: "line1\\\\nline2",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "post")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.strictEqual(
+      mapping.text,
+      "line1\nline2",
+      "Double-escaped \\\\n should become real newline",
+    );
+  });
+
+  it("normalizes triple-escaped \\\\\\n to real newline", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_newline_triple",
+      description: "Test triple escape",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "post",
+          label: "Post",
+          config: {
+            type: "api_call" as const,
+            operationId: "post-api-v1-chat_postMessage",
+            inputMapping: {
+              text: "a\\\\\\nb",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "post")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.strictEqual(
+      mapping.text,
+      "a\nb",
+      "Triple-escaped should become real newline",
+    );
+  });
+
+  it("does NOT mangle \\n in transform expressions (raw JS context is not normalized)", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_no_false_positive",
+      description: "Test that JS contexts are untouched",
+      params: { type: "object", properties: { data: { type: "string" } } },
+      steps: [
+        {
+          id: "parse",
+          label: "Parse",
+          config: {
+            type: "transform" as const,
+            expression: "params.data.split('\\n')",
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "parse")!;
+    const expr = (step.config as any).expression;
+    assert.ok(
+      expr.includes("\\n"),
+      `Transform expression should keep \\n as-is for JS, got: ${JSON.stringify(expr)}`,
+    );
+  });
+
+  it("normalizes \\t same as \\n (single + double)", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_tab",
+      description: "Test tab normalization",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "post",
+          label: "Post",
+          config: {
+            type: "api_call" as const,
+            operationId: "post-api-v1-chat_postMessage",
+            inputMapping: {
+              text: "col1\\tcol2\\\\tcol3",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "post")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.strictEqual(
+      mapping.text,
+      "col1\tcol2\tcol3",
+      "Both single and double escaped tabs should normalize",
+    );
+  });
+
+  it("handles multiple \\n in a single string", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_multi_newline",
+      description: "Test multiple newlines",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "post",
+          label: "Post",
+          config: {
+            type: "api_call" as const,
+            operationId: "post-api-v1-chat_postMessage",
+            inputMapping: {
+              text: "Header\\n\\nBody\\nFooter",
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "post")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.strictEqual(mapping.text, "Header\n\nBody\nFooter");
+  });
+
+  it("normalizes nested inputMapping (message.msg) double-escaped", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_nested_escape",
+      description: "Test nested inputMapping",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "send",
+          label: "Send",
+          config: {
+            type: "api_call" as const,
+            operationId: "post-api-v1-chat_sendMessage",
+            inputMapping: {
+              message: {
+                rid: "some-room-id",
+                msg: "Status:\\\\n- Item 1\\\\n- Item 2",
+              },
+            },
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "send")!;
+    const mapping = (step.config as any).inputMapping;
+    assert.strictEqual(
+      (mapping.message as any).msg,
+      "Status:\n- Item 1\n- Item 2",
+      "Double-escaped \\\\n in nested inputMapping should normalize",
+    );
+  });
+
+  it("normalizes prompt strings with double-escaped newlines", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_prompt_escape",
+      description: "Test prompt normalization",
+      params: { type: "object", properties: { data: { type: "string" } } },
+      steps: [
+        {
+          id: "classify",
+          label: "Classify",
+          config: {
+            type: "sampling" as const,
+            prompt: "Analyze this:\\\\n{{params.data}}",
+            systemPrompt: "You are a classifier.\\\\nBe concise.",
+          },
+        },
+      ],
+    });
+    const step = result.workflow.steps.find((s) => s.id === "classify")!;
+    const cfg = step.config as any;
+    assert.strictEqual(cfg.prompt, "Analyze this:\n{{params.data}}");
+    assert.strictEqual(cfg.systemPrompt, "You are a classifier.\nBe concise.");
+  });
+});
+
 // ── Fix A: .result auto-stripping ───────────────────────────────────────
 
 describe(".result auto-stripping", () => {
@@ -3984,7 +4767,9 @@ describe(".result auto-stripping", () => {
     });
     const step = result.workflow.steps.find((s) => s.id === "send")!;
     const mapping = (step.config as any).inputMapping;
-    assert.equal(mapping.msg, "{{steps.fetch.channel.name}}");
+    // After .result stripping: {{steps.fetch.channel.name}}
+    // After inferOutputPath: outputPath="channel" inferred, ref rewritten
+    assert.equal(mapping.msg, "{{steps.fetch.name}}");
     assert.ok(result.warnings.some((w) => w.code === "FIELD_STRIPPED"));
   });
 
@@ -4015,7 +4800,9 @@ describe(".result auto-stripping", () => {
       ],
     });
     const step = result.workflow.steps.find((s) => s.id === "calc")!;
-    assert.equal((step.config as any).expression, "steps.fetch.items.length");
+    // After .result stripping: steps.fetch.items.length
+    // After inferOutputPath: outputPath="items" inferred, ref rewritten
+    assert.equal((step.config as any).expression, "steps.fetch.length");
   });
 
   it("strips .result from conditional expressions", () => {
@@ -4055,10 +4842,9 @@ describe(".result auto-stripping", () => {
       ],
     });
     const step = result.workflow.steps.find((s) => s.id === "check")!;
-    assert.equal(
-      (step.config as any).condition,
-      "steps.analyze.violated === true",
-    );
+    // After .result stripping: steps.analyze.violated === true
+    // After inferOutputPath: outputPath="violated" inferred, ref rewritten
+    assert.equal((step.config as any).condition, "steps.analyze === true");
   });
 });
 
@@ -4171,6 +4957,911 @@ describe("composeWorkflowDefinition — stringified JSON normalization", () => {
     assert.equal(mapping.text, "hello world");
     assert.ok(
       !result.warnings.some((w) => w.code === "STRINGIFIED_JSON_PARSED"),
+    );
+  });
+});
+
+describe("bare params.X validation in JS contexts", () => {
+  it("condition with bare params.room passes when room is in schema", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_bare_param_cond",
+      description: "Bare param in condition",
+      params: {
+        type: "object",
+        properties: {
+          room: { type: "string" },
+          sender: { type: "string" },
+        },
+      },
+      steps: [
+        {
+          id: "check",
+          label: "Check Room",
+          config: {
+            type: "conditional" as const,
+            condition: "params.room === 'general'",
+            thenStep: "ok",
+          },
+        },
+        {
+          id: "ok",
+          label: "OK",
+          config: {
+            type: "api_call" as const,
+            operationId: "post-api-v1-chat_postMessage",
+            inputMapping: { channel: "#general", text: "ok" },
+          },
+        },
+      ],
+    });
+    assert.ok(result.workflow);
+  });
+
+  it("condition with bare params.unknownField throws", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_bare_unknown_cond",
+          description: "Bare unknown param in condition",
+          params: {
+            type: "object",
+            properties: {
+              room: { type: "string" },
+            },
+          },
+          steps: [
+            {
+              id: "check",
+              label: "Check",
+              config: {
+                type: "conditional" as const,
+                condition: "params.unknownField === true",
+                thenStep: "ok",
+              },
+            },
+            {
+              id: "ok",
+              label: "OK",
+              config: {
+                type: "api_call" as const,
+                operationId: "post-api-v1-chat_postMessage",
+                inputMapping: { channel: "#general", text: "ok" },
+              },
+            },
+          ],
+        }),
+      (err: any) => {
+        assert.ok(err.message.includes("params.unknownField"));
+        assert.ok(err.message.includes("not in the workflow params schema"));
+        return true;
+      },
+    );
+  });
+
+  it("transform with bare params.unknownField throws", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "test_bare_unknown_transform",
+          description: "Bare unknown param in transform",
+          params: {
+            type: "object",
+            properties: {
+              room: { type: "string" },
+            },
+          },
+          steps: [
+            {
+              id: "xform",
+              label: "Transform",
+              config: {
+                type: "transform" as const,
+                expression: "params.unknownField.x + 1",
+              },
+            },
+          ],
+        }),
+      (err: any) => {
+        assert.ok(err.message.includes("params.unknownField"));
+        assert.ok(err.message.includes("not in the workflow params schema"));
+        return true;
+      },
+    );
+  });
+
+  it("transform with bare params.room passes when room is in schema", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_bare_param_transform",
+      description: "Bare param in transform",
+      params: {
+        type: "object",
+        properties: {
+          room: { type: "string" },
+        },
+      },
+      steps: [
+        {
+          id: "xform",
+          label: "Transform",
+          config: {
+            type: "transform" as const,
+            expression: "params.room.toUpperCase()",
+          },
+        },
+      ],
+    });
+    assert.ok(result.workflow);
+  });
+
+  it("api_call with bare params.X in inputMapping is NOT validated as JS context", () => {
+    // api_call uses {{params.X}} templates, not bare refs — bare refs in api_call should not trigger validation
+    const result = composeWorkflowDefinition({
+      name: "test_api_no_bare",
+      description: "API call ignores bare param check",
+      params: {
+        type: "object",
+        properties: {
+          room: { type: "string" },
+        },
+      },
+      steps: [
+        {
+          id: "call",
+          label: "Call",
+          config: {
+            type: "api_call" as const,
+            operationId: "post-api-v1-chat_postMessage",
+            inputMapping: {
+              channel: "{{params.room}}",
+              text: "hello",
+            },
+          },
+        },
+      ],
+    });
+    assert.ok(result.workflow);
+  });
+});
+
+describe("command workflow with persistence.stateParam", () => {
+  it("{{params.stateParam}} resolves when persistence.stateParam is injected", () => {
+    // This tests Bug 1 fix indirectly — the generate tool's server.ts injects
+    // stateParam into effectiveParams for command workflows. Here we simulate
+    // the same by including the stateParam in the params schema.
+    const result = composeWorkflowDefinition({
+      name: "test_cmd_persistence",
+      description: "Command with persistence",
+      params: {
+        type: "object",
+        properties: {
+          room: { type: "string" },
+          sender: { type: "string" },
+          query: { type: "string" },
+          threadId: { type: "string" },
+          triggerId: { type: "string" },
+          incidentState: { type: "object", description: "Persisted state" },
+        },
+      },
+      steps: [
+        {
+          id: "check",
+          label: "Check State",
+          config: {
+            type: "conditional" as const,
+            condition: "params.incidentState && params.incidentState.count > 0",
+            thenStep: "notify",
+          },
+        },
+        {
+          id: "notify",
+          label: "Notify",
+          config: {
+            type: "api_call" as const,
+            operationId: "post-api-v1-chat_postMessage",
+            inputMapping: {
+              channel: "{{params.room}}",
+              text: "Count: {{params.incidentState.count}}",
+            },
+          },
+        },
+      ],
+    });
+    assert.ok(result.workflow);
+    // No errors — incidentState is recognized in both {{}} templates and bare JS
+  });
+});
+
+describe("inferOutputPath", () => {
+  it("infers outputPath when all downstream refs access the same field", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_infer",
+      description: "Test outputPath inference",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "get_channels",
+          label: "Fetch Channels",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels-list",
+            inputMapping: { count: 5 },
+          },
+        },
+        {
+          id: "process",
+          label: "Process",
+          config: {
+            type: "transform",
+            expression: "steps.get_channels.channels.map(c => c.name)",
+          },
+          dependsOn: ["get_channels"],
+        },
+      ],
+    });
+
+    const apiStep = result.workflow.steps.find((s) => s.id === "get_channels");
+    assert.ok(apiStep);
+    assert.equal(
+      (apiStep.config as any).outputPath,
+      "channels",
+      "outputPath should be inferred from downstream refs",
+    );
+    // Downstream ref should be rewritten to drop the field
+    const processStep = result.workflow.steps.find((s) => s.id === "process");
+    assert.ok(processStep);
+    assert.ok(
+      !(processStep.config as any).expression.includes(
+        "steps.get_channels.channels",
+      ),
+      "Downstream ref should be rewritten to drop the inferred field",
+    );
+    assert.ok(
+      (processStep.config as any).expression.includes("steps.get_channels.map"),
+      `Expected rewritten ref, got: ${(processStep.config as any).expression}`,
+    );
+
+    assert.ok(
+      result.warnings.some((w) => w.code === "OUTPUT_PATH_INFERRED"),
+      "Should emit OUTPUT_PATH_INFERRED warning",
+    );
+  });
+
+  it("fixes redundant extraction when outputPath already set", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_fix_redundant",
+      description: "Test redundant outputPath fix",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "get_history",
+          label: "Fetch History",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels-history",
+            inputMapping: { roomId: "R1" },
+            outputPath: "messages",
+          },
+        },
+        {
+          id: "summarize",
+          label: "Summarize",
+          config: {
+            type: "sampling",
+            prompt: "Summarize: {{steps.get_history.messages}}",
+          },
+          dependsOn: ["get_history"],
+        },
+      ],
+    });
+
+    const summarizeStep = result.workflow.steps.find(
+      (s) => s.id === "summarize",
+    );
+    assert.ok(summarizeStep);
+    assert.equal(
+      (summarizeStep.config as any).prompt,
+      "Summarize: {{steps.get_history}}",
+      "Redundant .messages should be stripped since outputPath already extracts it",
+    );
+    assert.ok(
+      result.warnings.some((w) => w.code === "OUTPUT_PATH_REF_FIXED"),
+      "Should emit OUTPUT_PATH_REF_FIXED warning",
+    );
+  });
+
+  it("does not infer when downstream refs access different fields", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_no_infer",
+      description: "Test no inference with mixed fields",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "get_data",
+          label: "Fetch Data",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels-info",
+            inputMapping: { roomId: "R1" },
+          },
+        },
+        {
+          id: "use_a",
+          label: "Use A",
+          config: {
+            type: "sampling",
+            prompt: "Channel: {{steps.get_data.channel}}",
+          },
+          dependsOn: ["get_data"],
+        },
+        {
+          id: "use_b",
+          label: "Use B",
+          config: {
+            type: "sampling",
+            prompt: "Success: {{steps.get_data.success}}",
+          },
+          dependsOn: ["get_data"],
+        },
+      ],
+    });
+
+    const apiStep = result.workflow.steps.find((s) => s.id === "get_data");
+    assert.ok(apiStep);
+    assert.equal(
+      (apiStep.config as any).outputPath,
+      undefined,
+      "Should NOT infer outputPath when multiple different fields are accessed",
+    );
+    assert.ok(!result.warnings.some((w) => w.code === "OUTPUT_PATH_INFERRED"));
+  });
+
+  it("handles template context refs in forEach", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_foreach_infer",
+      description: "Test outputPath inference with forEach",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "get_channels",
+          label: "Fetch Channels",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels-list",
+            inputMapping: {},
+          },
+        },
+        {
+          id: "process_each",
+          label: "Process Each",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels-info",
+            inputMapping: { roomId: "{{ch._id}}" },
+            forEach: "{{steps.get_channels.channels}}",
+            as: "ch",
+          },
+          dependsOn: ["get_channels"],
+        },
+      ],
+    });
+
+    const apiStep = result.workflow.steps.find((s) => s.id === "get_channels");
+    assert.equal(
+      (apiStep!.config as any).outputPath,
+      "channels",
+      "outputPath should be inferred from forEach ref",
+    );
+
+    const forEachStep = result.workflow.steps.find(
+      (s) => s.id === "process_each",
+    );
+    assert.equal(
+      (forEachStep!.config as any).forEach,
+      "{{steps.get_channels}}",
+      "forEach ref should be rewritten to drop field",
+    );
+  });
+
+  it("leaves explicit outputPath with correct refs unchanged", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_explicit_correct",
+      description: "Test explicit outputPath with correct refs",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "get_channels",
+          label: "Fetch",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels-list",
+            inputMapping: {},
+            outputPath: "channels",
+          },
+        },
+        {
+          id: "use",
+          label: "Use",
+          config: {
+            type: "sampling",
+            prompt: "Channels: {{steps.get_channels}}",
+          },
+          dependsOn: ["get_channels"],
+        },
+      ],
+    });
+
+    assert.equal(
+      (
+        result.workflow.steps.find((s) => s.id === "get_channels")!
+          .config as any
+      ).outputPath,
+      "channels",
+    );
+    assert.equal(
+      (result.workflow.steps.find((s) => s.id === "use")!.config as any).prompt,
+      "Channels: {{steps.get_channels}}",
+      "Correct refs should not be modified",
+    );
+    assert.ok(
+      !result.warnings.some(
+        (w) =>
+          w.code === "OUTPUT_PATH_INFERRED" ||
+          w.code === "OUTPUT_PATH_REF_FIXED",
+      ),
+    );
+  });
+
+  it("rewrites refs in inputMapping values", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_infer_input",
+      description: "Test inference with inputMapping",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "create_ch",
+          label: "Create Channel",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-channels-create",
+            inputMapping: { name: "test" },
+          },
+        },
+        {
+          id: "post_msg",
+          label: "Post Message",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-chat-postMessage",
+            inputMapping: {
+              channel: "#{{steps.create_ch.channel.name}}",
+              text: "Hello",
+            },
+          },
+          dependsOn: ["create_ch"],
+        },
+      ],
+    });
+
+    const createStep = result.workflow.steps.find((s) => s.id === "create_ch");
+    assert.equal(
+      (createStep!.config as any).outputPath,
+      "channel",
+      "outputPath should be inferred from inputMapping ref",
+    );
+
+    const postStep = result.workflow.steps.find((s) => s.id === "post_msg");
+    assert.equal(
+      (postStep!.config as any).inputMapping.channel,
+      "#{{steps.create_ch.name}}",
+      "inputMapping ref should be rewritten to drop inferred field",
+    );
+  });
+
+  it("handles optional chaining in transform expressions (steps.X?.field)", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_optional_chain",
+      description: "Test optional chaining detection and rewrite",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "create_room",
+          label: "Create Room",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-channels-create",
+            inputMapping: { name: "incident-room" },
+          },
+        },
+        {
+          id: "set_state",
+          label: "Set State",
+          config: {
+            type: "transform",
+            expression:
+              '{ roomId: steps.create_room?.channel?._id || "fallback" }',
+          },
+          dependsOn: ["create_room"],
+        },
+      ],
+    });
+
+    const apiStep = result.workflow.steps.find((s) => s.id === "create_room");
+    assert.equal(
+      (apiStep!.config as any).outputPath,
+      "channel",
+      "outputPath should be inferred from optional-chaining ref",
+    );
+
+    const transformStep = result.workflow.steps.find(
+      (s) => s.id === "set_state",
+    );
+    const expr = (transformStep!.config as any).expression;
+    assert.ok(
+      !expr.includes("create_room?.channel"),
+      `Optional-chaining ref should be rewritten, got: ${expr}`,
+    );
+    assert.ok(
+      expr.includes("steps.create_room?._id"),
+      `Expected steps.create_room?._id, got: ${expr}`,
+    );
+  });
+
+  it("handles mixed regular and optional chaining refs to same field", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_mixed_chain",
+      description: "Test mixed dot and optional chaining",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "get_info",
+          label: "Get Info",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels-info",
+            inputMapping: { roomId: "R1" },
+          },
+        },
+        {
+          id: "use_template",
+          label: "Use Template",
+          config: {
+            type: "sampling",
+            prompt: "Name: {{steps.get_info.channel.name}}",
+          },
+          dependsOn: ["get_info"],
+        },
+        {
+          id: "use_js",
+          label: "Use JS",
+          config: {
+            type: "conditional",
+            condition: 'steps.get_info?.channel?.type === "c"',
+            thenStep: "use_template",
+          },
+          dependsOn: ["get_info"],
+        },
+      ],
+    });
+
+    const apiStep = result.workflow.steps.find((s) => s.id === "get_info");
+    assert.equal(
+      (apiStep!.config as any).outputPath,
+      "channel",
+      "Should infer from both template and optional-chaining refs",
+    );
+
+    const tmplStep = result.workflow.steps.find((s) => s.id === "use_template");
+    assert.equal(
+      (tmplStep!.config as any).prompt,
+      "Name: {{steps.get_info.name}}",
+      "Template ref should be rewritten",
+    );
+
+    const condStep = result.workflow.steps.find((s) => s.id === "use_js");
+    const cond = (condStep!.config as any).condition;
+    assert.ok(
+      !cond.includes("get_info?.channel"),
+      `Optional-chaining ref should be rewritten, got: ${cond}`,
+    );
+    assert.ok(
+      cond.includes('steps.get_info?.type === "c"'),
+      `Expected steps.get_info?.type, got: ${cond}`,
+    );
+  });
+
+  it("rewrites steps.X.field?._id (optional chaining after the extracted field)", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_chain_after_field",
+      description: "Test optional chaining after the extracted field",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "fetch",
+          label: "Fetch",
+          config: {
+            type: "api_call",
+            operationId: "post-api-v1-channels-create",
+            inputMapping: { name: "test" },
+          },
+        },
+        {
+          id: "use",
+          label: "Use",
+          config: {
+            type: "transform",
+            expression: "steps.fetch.channel?._id",
+          },
+          dependsOn: ["fetch"],
+        },
+      ],
+    });
+
+    const apiStep = result.workflow.steps.find((s) => s.id === "fetch");
+    assert.equal(
+      (apiStep!.config as any).outputPath,
+      "channel",
+      "outputPath should be inferred",
+    );
+
+    const useStep = result.workflow.steps.find((s) => s.id === "use");
+    const expr = (useStep!.config as any).expression;
+    assert.equal(
+      expr,
+      "steps.fetch?._id",
+      `Should rewrite to steps.fetch?._id, got: ${expr}`,
+    );
+  });
+
+  it("handles optional chaining with nullish coalescing and fallback", () => {
+    const result = composeWorkflowDefinition({
+      name: "test_nullish",
+      description: "Test optional chaining with ?? fallback",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "get_data",
+          label: "Get Data",
+          config: {
+            type: "api_call",
+            operationId: "get-api-v1-channels-list",
+            inputMapping: {},
+          },
+        },
+        {
+          id: "safe_use",
+          label: "Safe Use",
+          config: {
+            type: "transform",
+            expression: "steps.get_data?.channels?.length ?? 0",
+          },
+          dependsOn: ["get_data"],
+        },
+      ],
+    });
+
+    const apiStep = result.workflow.steps.find((s) => s.id === "get_data");
+    assert.equal(
+      (apiStep!.config as any).outputPath,
+      "channels",
+      "outputPath should be inferred from optional-chaining ref with nullish coalescing",
+    );
+
+    const useStep = result.workflow.steps.find((s) => s.id === "safe_use");
+    const expr = (useStep!.config as any).expression;
+    assert.ok(
+      !expr.includes("get_data?.channels"),
+      `Optional-chaining ref should be rewritten, got: ${expr}`,
+    );
+    assert.ok(
+      expr.includes("steps.get_data?.length"),
+      `Expected steps.get_data?.length, got: ${expr}`,
+    );
+  });
+});
+
+describe("inferMissingConditionalTargets", () => {
+  it("auto-infers thenStep when exactly 1 step depends on the conditional", () => {
+    const result = composeWorkflowDefinition({
+      name: "infer_then",
+      description: "Test thenStep inference",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "gate",
+          label: "Gate",
+          config: {
+            type: "conditional",
+            condition: "true",
+            // thenStep intentionally omitted
+          } as any,
+        },
+        {
+          id: "action",
+          label: "Action",
+          config: { type: "transform", expression: "'done'" },
+          dependsOn: ["gate"],
+        },
+      ],
+    });
+
+    const gateStep = result.workflow.steps.find((s) => s.id === "gate")!;
+    assert.equal(
+      (gateStep.config as any).thenStep,
+      "action",
+      "thenStep should be auto-inferred from the single dependent",
+    );
+    assert.ok(
+      result.warnings.some(
+        (w) => w.code === "FIELD_AUTO_SET" && w.message.includes("thenStep"),
+      ),
+      "Should emit FIELD_AUTO_SET warning for inferred thenStep",
+    );
+  });
+
+  it("hard-errors when conditional has 0 dependents and no thenStep", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "no_dep",
+          description: "No dependents",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "gate",
+              label: "Gate",
+              config: {
+                type: "conditional",
+                condition: "true",
+              } as any,
+            },
+            {
+              id: "other",
+              label: "Other",
+              config: { type: "transform", expression: "'x'" },
+              // does NOT depend on gate
+            },
+          ],
+        }),
+      /thenStep is required.*cannot infer/i,
+    );
+  });
+
+  it("hard-errors when conditional has 2+ dependents and no thenStep (ambiguous)", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "multi_dep",
+          description: "Multiple dependents",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "gate",
+              label: "Gate",
+              config: {
+                type: "conditional",
+                condition: "true",
+              } as any,
+            },
+            {
+              id: "branch_a",
+              label: "A",
+              config: { type: "transform", expression: "'a'" },
+              dependsOn: ["gate"],
+            },
+            {
+              id: "branch_b",
+              label: "B",
+              config: { type: "transform", expression: "'b'" },
+              dependsOn: ["gate"],
+            },
+          ],
+        }),
+      /thenStep is required.*Multiple steps/i,
+    );
+  });
+
+  it("infers thenStep when elseStep is present and 1 other dependent exists", () => {
+    const result = composeWorkflowDefinition({
+      name: "infer_with_else",
+      description: "Test with elseStep",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "check",
+          label: "Check",
+          config: {
+            type: "conditional",
+            condition: "true",
+            elseStep: "fallback",
+            // thenStep intentionally omitted
+          } as any,
+        },
+        {
+          id: "primary",
+          label: "Primary",
+          config: { type: "transform", expression: "'yes'" },
+          dependsOn: ["check"],
+        },
+        {
+          id: "fallback",
+          label: "Fallback",
+          config: { type: "transform", expression: "'no'" },
+          dependsOn: ["check"],
+        },
+      ],
+    });
+
+    const checkStep = result.workflow.steps.find((s) => s.id === "check")!;
+    assert.equal(
+      (checkStep.config as any).thenStep,
+      "primary",
+      "thenStep should be inferred from the dependent that is NOT the elseStep",
+    );
+  });
+
+  it("hard-errors when elseStep present but 0 other dependents for thenStep", () => {
+    assert.throws(
+      () =>
+        composeWorkflowDefinition({
+          name: "else_only",
+          description: "Only elseStep",
+          params: { type: "object", properties: {} },
+          steps: [
+            {
+              id: "check",
+              label: "Check",
+              config: {
+                type: "conditional",
+                condition: "true",
+                elseStep: "fallback",
+              } as any,
+            },
+            {
+              id: "fallback",
+              label: "Fallback",
+              config: { type: "transform", expression: "'no'" },
+              dependsOn: ["check"],
+            },
+          ],
+        }),
+      /thenStep is required.*no other step depends/i,
+    );
+  });
+
+  it("does not modify conditionals that already have thenStep", () => {
+    const result = composeWorkflowDefinition({
+      name: "already_has",
+      description: "Has thenStep",
+      params: { type: "object", properties: {} },
+      steps: [
+        {
+          id: "gate",
+          label: "Gate",
+          config: {
+            type: "conditional",
+            condition: "true",
+            thenStep: "action",
+          },
+        },
+        {
+          id: "action",
+          label: "Action",
+          config: { type: "transform", expression: "'done'" },
+          dependsOn: ["gate"],
+        },
+      ],
+    });
+
+    const gateStep = result.workflow.steps.find((s) => s.id === "gate")!;
+    assert.equal((gateStep.config as any).thenStep, "action");
+    assert.ok(
+      !result.warnings.some(
+        (w) =>
+          w.code === "FIELD_AUTO_SET" &&
+          w.message.includes("thenStep") &&
+          w.stepId === "gate",
+      ),
+      "Should NOT emit inference warning when thenStep was already set",
     );
   });
 });

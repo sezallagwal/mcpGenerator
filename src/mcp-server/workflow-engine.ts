@@ -106,6 +106,24 @@ function isValidParamName(name: string): boolean {
   return /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name) && !JS_RESERVED.has(name);
 }
 
+/** Build JS scope: params + steps + bare param keys as identifiers; locals (forEach vars) shadow params. */
+function buildJsScope(
+  params: Record<string, unknown>,
+  steps: Record<string, unknown>,
+  locals: Record<string, unknown> = {},
+): { argNames: string[]; argValues: unknown[] } {
+  const scope = new Map<string, unknown>();
+  scope.set("params", params);
+  scope.set("steps", steps);
+  for (const [k, v] of Object.entries(params)) {
+    if (isValidParamName(k)) scope.set(k, v);
+  }
+  for (const [k, v] of Object.entries(locals)) {
+    if (isValidParamName(k)) scope.set(k, v);
+  }
+  return { argNames: [...scope.keys()], argValues: [...scope.values()] };
+}
+
 export function resolveTemplate(
   template: string,
   params: Record<string, unknown>,
@@ -116,19 +134,11 @@ export function resolveTemplate(
     .replace(/\{\{\[params\.([^\]]+)\]\}\}/g, "{{params.$1}}")
     .replace(/\{\{\[steps\.([^\]]+)\]\}\}/g, "{{steps.$1}}");
 
-  // Build scope: params properties (low priority), then locals (high priority)
-  // forEach locals shadow same-name params — that's always the correct behaviour
-  const scope = new Map<string, unknown>();
-  scope.set("params", params);
-  scope.set("steps", steps);
-  for (const [k, v] of Object.entries(params)) {
-    if (isValidParamName(k)) scope.set(k, v);
-  }
-  for (const [k, v] of Object.entries(locals)) {
-    if (isValidParamName(k)) scope.set(k, v);
-  }
-  const scopeNames = [...scope.keys()];
-  const scopeValues = [...scope.values()];
+  const { argNames: scopeNames, argValues: scopeValues } = buildJsScope(
+    params,
+    steps,
+    locals,
+  );
 
   return cleaned.replace(/\{\{([^}]+)\}\}/g, (_, expr: string) => {
     try {
@@ -266,12 +276,20 @@ export function shouldRun(stepId: string, state: ExecutionState): boolean {
     return false;
   }
   const deps = state.stepDeps[stepId] || [];
-  if (deps.some((d) => state.stepStatus[d] === "skipped")) {
+  // Phase 1: Wait until every dependency reaches a terminal state
+  const allTerminal = deps.every(
+    (d) =>
+      state.completedSteps.includes(d) || state.stepStatus[d] === "skipped",
+  );
+  if (!allTerminal) return false;
+  // Phase 2: Skip only when ALL deps were skipped (no useful input)
+  if (deps.length > 0 && deps.every((d) => state.stepStatus[d] === "skipped")) {
     state.stepResults[stepId] = null;
     state.stepStatus[stepId] = "skipped";
     return false;
   }
-  return deps.every((d) => state.completedSteps.includes(d));
+  // Phase 3: At least one dep succeeded — run this step
+  return true;
 }
 
 // ── Bot message filtering ─────────────────────────────────────────────────
@@ -567,6 +585,14 @@ async function normalizePayload(
     payload.members = resolved;
   }
 
+  // Prefix bare channel names with "#" for the RC postMessage API
+  if (typeof payload.channel === "string" && payload.channel.length > 0) {
+    const ch = payload.channel;
+    if (!ch.startsWith("#") && !ch.startsWith("@") && !looksLikeMongoId(ch)) {
+      payload.channel = `#${ch}`;
+    }
+  }
+
   if (payload.channel === "@admin") {
     const adminUser = process.env.ROCKETCHAT_USER;
     if (adminUser) payload.channel = `@${adminUser}`;
@@ -586,14 +612,27 @@ async function executeSingleApiCall(
 
   if (step.inputMapping) {
     for (const [key, raw] of Object.entries(step.inputMapping)) {
-      if (typeof raw === "string" && raw.includes("{{")) {
-        const resolved = payload[key];
-        if (resolved === "" || resolved === undefined || resolved === null) {
-          throw new Error(
-            `Parameter "${key}" resolved to empty (template: ${raw}). ` +
-              `This usually means an optional event field is absent.`,
-          );
-        }
+      if (typeof raw !== "string" || !raw.includes("{{")) continue;
+      const resolved = payload[key];
+      if (resolved !== "" && resolved !== undefined && resolved !== null)
+        continue;
+
+      // Check if the root reference actually exists in params/steps
+      const paramMatch = raw.match(/\{\{\s*params\.(\w+)/);
+      const stepMatch = raw.match(/\{\{\s*steps\.(\w+)/);
+
+      if (paramMatch && !(paramMatch[1] in state.params)) {
+        // Root param doesn't exist — genuinely optional (e.g. threadId absent)
+        delete payload[key];
+      } else if (stepMatch && !(stepMatch[1] in state.stepResults)) {
+        // Referenced step hasn't run — strip
+        delete payload[key];
+      } else {
+        // Root exists but resolved to empty — that's a real problem
+        throw new Error(
+          `Parameter "${key}" resolved to empty (template: ${raw}). ` +
+            `The referenced value exists but is empty or broken.`,
+        );
       }
     }
   }
@@ -722,12 +761,14 @@ async function executeSingleApiCall(
         "";
       if (channel) {
         try {
-          // channel could be "#name", "@user", or a roomId
+          // channel could be "#name", "@user", bare name, or a roomId
           const channelName = channel.startsWith("#")
             ? channel.slice(1)
             : channel.startsWith("@")
               ? null
-              : null;
+              : !looksLikeMongoId(channel)
+                ? channel
+                : null;
           let roomId: string | null = null;
 
           if (channelName) {
@@ -1229,14 +1270,15 @@ async function executeElicitation(
 function executeTransform(step: StepDefinition, state: ExecutionState): void {
   const expr = step.expression || "null";
   validateExpression(expr, "transform");
+  const { argNames, argValues } = buildJsScope(state.params, state.stepResults);
   let fn: Function;
   try {
-    fn = new Function("steps", "params", `"use strict"; return (${expr});`);
+    fn = new Function(...argNames, `"use strict"; return (${expr});`);
   } catch {
     const withReturn = autoReturn(expr);
-    fn = new Function("steps", "params", `"use strict"; ${withReturn}`);
+    fn = new Function(...argNames, `"use strict"; ${withReturn}`);
   }
-  const result = fn(state.stepResults, state.params);
+  const result = fn(...argValues);
   state.stepResults[step.id] = result;
   state.stepStatus[step.id] = "success";
   state.completedSteps.push(step.id);
@@ -1285,15 +1327,12 @@ export function autoReturn(expr: string): string {
 function executeConditional(step: StepDefinition, state: ExecutionState): void {
   const expr = step.condition || "false";
   validateExpression(expr, "conditional");
-  const fn = new Function(
-    "steps",
-    "params",
-    `"use strict"; return !!(${expr});`,
-  );
+  const { argNames, argValues } = buildJsScope(state.params, state.stepResults);
+  const fn = new Function(...argNames, `"use strict"; return !!(${expr});`);
 
   let conditionResult: boolean;
   try {
-    conditionResult = fn(state.stepResults, state.params);
+    conditionResult = fn(...argValues);
   } catch {
     conditionResult = false;
   }

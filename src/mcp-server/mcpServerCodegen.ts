@@ -46,7 +46,7 @@ const OPERATION_PERMISSION_MAP: Array<{
   // Chat (messaging) — any chat.* operation
   {
     pattern: /chat[._-]/,
-    permissions: ["create-d", "post-readonly"],
+    permissions: ["create-d", "post-readonly", "mention-here", "mention-all"],
   },
   // Chat destructive ops — delete/update messages
   {
@@ -538,9 +538,16 @@ ${
   const PREFERRED_PORT = parseInt(process.env.MCP_HTTP_PORT || "3001", 10);
   const MAX_PORT_ATTEMPTS = 10;
   let actualPort = PREFERRED_PORT;
+  let autoConfigDone = false;
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     console.error(\`[HTTP] \${req.method} \${req.url} from \${req.socket.remoteAddress}\`);
+
+    if (!autoConfigDone) {
+      res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "3" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32000, message: "Server initializing — auto-config in progress, retry shortly" } }));
+      return;
+    }
 
     if (req.method !== "POST" || req.url !== "/mcp") {
       res.writeHead(404, { "Content-Type": "application/json" });
@@ -925,6 +932,9 @@ ${derivedPermEntries}
       }
     } catch (e) {
       console.error(\`[Auto-config] Could not auto-configure: \${e instanceof Error ? e.message : e}\`);
+    } finally {
+      autoConfigDone = true;
+      console.error("[Auto-config] Complete — HTTP bridge now accepting requests.");
     }
   })();
   } // end runAutoConfig

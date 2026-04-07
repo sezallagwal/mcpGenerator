@@ -57,7 +57,7 @@ describe("formatCapabilityGuide", () => {
     assert.ok(result.includes("## rooms"));
     assert.ok(
       result.includes(
-        "Send Message (needs rid; supports tmid for threads) → post-api-v1-chat_sendMessage",
+        "Send Message (needs rid; supports tmid for threads; does NOT resolve @here, @all, @user mentions or #channel names \u2014 use postMessage if you need mention pings or channel-name lookup) → post-api-v1-chat_sendMessage",
       ),
     );
     assert.ok(result.includes("Delete Message → post-api-v1-chat_delete"));
@@ -147,7 +147,7 @@ describe("formatCapabilityGuide", () => {
     const result = formatCapabilityGuide(endpoints);
     assert.ok(
       result.includes(
-        "Post Message (resolves #channel and @user names) → post-api-v1-chat_postMessage",
+        "Post Message (resolves #channel and @user names; processes @here/@all mentions; use when sending by channel name) → post-api-v1-chat_postMessage",
       ),
     );
     assert.ok(!result.includes("[channel, text"));
@@ -265,7 +265,7 @@ describe("formatCapabilityGuide", () => {
     // Annotated endpoints include the hint
     assert.ok(
       result.includes(
-        "Post Message (resolves #channel and @user names) → post-api-v1-chat_postMessage",
+        "Post Message (resolves #channel and @user names; processes @here/@all mentions; use when sending by channel name) → post-api-v1-chat_postMessage",
       ),
     );
     assert.ok(

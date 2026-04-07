@@ -377,11 +377,40 @@ export async function listEndpoints(
   return results;
 }
 
+/** Simple iterative Levenshtein distance (no external deps). */
+function levenshtein(a: string, b: string): number {
+  const m = a.length,
+    n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = Array.from({ length: n + 1 }, (_, i) => i);
+  for (let i = 1; i <= m; i++) {
+    const curr = [i];
+    for (let j = 1; j <= n; j++) {
+      curr[j] =
+        a[i - 1] === b[j - 1]
+          ? prev[j - 1]
+          : 1 + Math.min(prev[j - 1], prev[j], curr[j - 1]);
+    }
+    prev = curr;
+  }
+  return prev[n];
+}
+
+/** Corrections found during the last getFullEndpoints call (requestedId → actualId). */
+let lastCorrectedIds = new Map<string, string>();
+
+/** Get the fuzzy-corrected operationId map from the most recent getFullEndpoints call. */
+export function getLastCorrectedIds(): ReadonlyMap<string, string> {
+  return lastCorrectedIds;
+}
+
 export async function getFullEndpoints(
   operationIds: string[],
   domains?: Domain[],
   maxDepth?: number,
 ): Promise<FullEndpoint[]> {
+  lastCorrectedIds = new Map();
   let domainsToSearch: Domain[];
   if (domains) {
     domainsToSearch = domains;
@@ -434,7 +463,37 @@ export async function getFullEndpoints(
           !results.some((r) => r.operationId === ep.operationId)
         ) {
           results.push(ep);
+          const origId = missingNorm.get(normId)!;
+          if (origId !== ep.operationId) {
+            lastCorrectedIds.set(origId, ep.operationId);
+          }
           missingNorm.delete(normId);
+        }
+      }
+    }
+
+    // Tier 3: Levenshtein fuzzy matching (distance ≤ 2) for remaining unresolved IDs
+    if (missingNorm.size > 0) {
+      const normalize2 = (s: string) => s.toLowerCase().replace(/[_-]/g, "");
+      for (let i = 0; i < domainsToSearch.length; i++) {
+        if (missingNorm.size === 0) break;
+        const allEps = extractFullEndpoints(
+          specs[i],
+          domainsToSearch[i],
+          undefined,
+          maxDepth,
+        );
+        for (const ep of allEps) {
+          if (results.some((r) => r.operationId === ep.operationId)) continue;
+          const normCandidate = normalize2(ep.operationId);
+          for (const [normReq, origReq] of missingNorm) {
+            if (levenshtein(normalize2(origReq), normCandidate) <= 2) {
+              results.push(ep);
+              lastCorrectedIds.set(origReq, ep.operationId);
+              missingNorm.delete(normReq);
+              break;
+            }
+          }
         }
       }
     }

@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   listEndpoints,
   getFullEndpoints,
+  getLastCorrectedIds,
   getAvailableDomains,
 } from "./mcp-server/parser/index.js";
 import {
@@ -38,50 +39,13 @@ import {
   formatCapabilityGuide,
   formatAppEventsGuide,
 } from "./capability-guide.js";
-
-const COMMAND_BRIDGE_PARAMS: Record<string, unknown> = {
-  type: "object",
-  properties: {
-    room: {
-      type: "object",
-      description: "Room where the command was invoked",
-      properties: {
-        id: { type: "string", description: "Room ID" },
-        type: {
-          type: "string",
-          description:
-            "Room type: c (channel), p (private), d (DM), l (livechat)",
-        },
-        displayName: {
-          type: "string",
-          description: "Human-readable room name",
-        },
-      },
-    },
-    sender: {
-      type: "object",
-      description: "User who invoked the command",
-      properties: {
-        id: { type: "string", description: "User ID" },
-        username: { type: "string", description: "Username" },
-        name: { type: "string", description: "Display name" },
-      },
-    },
-    query: {
-      type: "string",
-      description: "Full argument string after /command",
-    },
-    threadId: {
-      type: "string",
-      description:
-        "Parent message ID if command was typed inside a thread (use as tmid for thread replies)",
-    },
-    triggerId: {
-      type: "string",
-      description: "UI trigger ID for interactive elements",
-    },
-  },
-};
+import {
+  COMMAND_BRIDGE_PARAMS,
+  deriveCommandKeyPath,
+  autoInjectPersistence,
+  autoCorrectEventParamRefs,
+  autoCorrectDeepParamRefs,
+} from "./persistence-helpers.js";
 
 function shapeToJsonSchema(
   shape: Record<string, unknown>,
@@ -238,11 +202,28 @@ server.registerTool(
         schemas[ep.operationId] = entry;
       }
 
+      // Enrich ambiguous schema fields with domain knowledge
+      const chCreate = schemas["post-api-v1-channels_create"];
+      if (chCreate) {
+        const chProps = (chCreate.requestBody as any)?.properties;
+        if (chProps?.members) {
+          chProps.members.description =
+            "An array of usernames (NOT user IDs) to add to the channel. " +
+            'Use sender.username, not sender.id. Example: ["john.doe"]';
+        }
+      }
+
       const matched = new Set(endpoints.map((e) => e.operationId));
-      const unmatched = operationIds.filter((id) => !matched.has(id));
+      const corrected = getLastCorrectedIds();
+      const unmatched = operationIds.filter(
+        (id) => !matched.has(id) && !corrected.has(id),
+      );
 
       const result: Record<string, unknown> = { endpoints: schemas };
 
+      if (corrected.size > 0) {
+        result.correctedOperationIds = Object.fromEntries(corrected);
+      }
       if (unmatched.length > 0) {
         result.unmatchedOperationIds = unmatched;
       }
@@ -296,13 +277,35 @@ server.registerTool(
         z.object({
           name: z.string(),
           description: z.string(),
-          triggerEvent: z.string().optional(),
-          command: z.string().optional(),
-          params: z.record(z.string(), z.any()).optional(),
+          triggerEvent: z
+            .string()
+            .nullable()
+            .optional()
+            .transform((v) => v ?? undefined)
+            .describe(
+              "RC Apps event interface name (e.g. IPostMessageSent). Set this OR command, never both. When set, OMIT params — the engine derives params from the event shape automatically.",
+            ),
+          command: z
+            .string()
+            .nullable()
+            .optional()
+            .transform((v) => v ?? undefined)
+            .describe(
+              "Slash command name WITHOUT leading slash (e.g. 'resolve'). Set this OR triggerEvent, never both. Params are auto-injected: room.{id,type,displayName}, sender.{id,username,name}, query, threadId, triggerId.",
+            ),
+          params: z
+            .record(z.string(), z.any())
+            .nullable()
+            .optional()
+            .transform((v) => v ?? undefined),
           steps: z.array(
             z.object({
               id: z.string(),
-              label: z.string().optional(),
+              label: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
               type: z.enum([
                 "api_call",
                 "transform",
@@ -310,41 +313,134 @@ server.registerTool(
                 "conditional",
                 "elicitation",
               ]),
-              dependsOn: z.array(z.string()).optional(),
-              operationId: z.string().optional(),
+              dependsOn: z
+                .array(z.string())
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              operationId: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
               inputMapping: z
                 .record(z.string(), z.any())
+                .nullable()
                 .optional()
+                .transform((v) => v ?? undefined)
                 .describe(
                   'Map of field→value. Values MUST be native JSON types (objects, arrays, numbers), NOT pre-stringified JSON strings. Example: {"sort": {"msgs": -1}}, NOT {"sort": "{\\"msgs\\": -1}"}.',
                 ),
-              continueOnError: z.boolean().optional(),
-              outputPath: z.string().optional(),
-              forEach: z.string().optional(),
-              as: z.string().optional(),
-              prompt: z.string().optional(),
-              systemPrompt: z.string().optional(),
-              maxTokens: z.number().optional(),
-              message: z.string().optional(),
-              requestedSchema: z.record(z.string(), z.any()).optional(),
-              expression: z.string().optional(),
-              condition: z.string().optional(),
-              thenStep: z.string().optional(),
-              elseStep: z.string().optional(),
+              continueOnError: z
+                .boolean()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              outputPath: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              forEach: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              as: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              prompt: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              systemPrompt: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              maxTokens: z
+                .number()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              message: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              requestedSchema: z
+                .record(z.string(), z.any())
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              expression: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              condition: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              thenStep: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
+              elseStep: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined),
             }),
           ),
           persistence: z
             .object({
-              model: z.enum(["user", "room", "misc"]),
+              model: z
+                .enum(["user", "room", "misc"])
+                .describe(
+                  "Scope: 'user' = per-user state, 'room' = per-room state, 'misc' = global state.",
+                ),
               keyPath: z.string(),
-              stateParam: z.string(),
+              stateParam: z
+                .string()
+                .describe(
+                  "Name injected into params holding the loaded state object. Your workflow steps MUST reference this via {{params.<stateParam>}} — if unused, the state serves no purpose.",
+                ),
               defaultState: z.unknown(),
-              updateFromStep: z.string().optional(),
+              updateFromStep: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined)
+                .describe(
+                  "ID of the transform step whose result becomes the new persisted state. MUST be a transform step (not api_call/sampling).",
+                ),
+              writeKeyFrom: z
+                .string()
+                .nullable()
+                .optional()
+                .transform((v) => v ?? undefined)
+                .describe(
+                  "Dotted path into the updateFromStep result to extract the persistence write key. " +
+                    'Format: "<stepId>.<field>". Used when the event handler writes state for a different room/user ' +
+                    "than it reads from (e.g. writing to a newly created channel's ID instead of the trigger room).",
+                ),
             })
-            .optional(),
+            .nullable()
+            .optional()
+            .transform((v) => v ?? undefined),
         }),
       ),
-      eventInterfaces: z.array(z.string()).optional(),
+      eventInterfaces: z
+        .array(z.string())
+        .nullable()
+        .optional()
+        .transform((v) => v ?? undefined),
       webhookEndpoints: z
         .array(
           z.object({
@@ -353,7 +449,9 @@ server.registerTool(
             methods: z.array(z.enum(["get", "post"])),
           }),
         )
-        .optional(),
+        .nullable()
+        .optional()
+        .transform((v) => v ?? undefined),
     },
   },
   async ({
@@ -382,8 +480,11 @@ server.registerTool(
       const needsRcApp =
         hasEventWorkflows || hasCommandWorkflows || hasWebhooks;
 
+      const allComposerWarnings: string[] = [
+        ...autoInjectPersistence(rawWorkflows as any),
+      ];
+
       const workflowDefs: WorkflowDefinition[] = [];
-      const allComposerWarnings: string[] = [];
       for (const raw of rawWorkflows) {
         try {
           let effectiveParams = raw.params as
@@ -401,13 +502,55 @@ server.registerTool(
               );
             }
             effectiveParams = derived;
+
+            // Auto-correct domain-key skips (params.room → params.message.room)
+            const infoMap = resolveEventInfo([raw.triggerEvent]);
+            const eventShape: Record<string, Record<string, unknown>> = {};
+            for (const [ifName, info] of Object.entries(infoMap)) {
+              if (info.shape && typeof info.shape === "object") {
+                eventShape[info.param] = info.shape as Record<string, unknown>;
+              }
+            }
+            const domainKeySet = new Set(
+              Object.keys((derived as any).properties),
+            );
+            const paramCorrections = autoCorrectEventParamRefs(
+              raw as any,
+              domainKeySet,
+              eventShape,
+            );
+            allComposerWarnings.push(...paramCorrections);
+
+            // Auto-correct hallucinated properties (room.name → room.displayName)
+            const deepCorrections = autoCorrectDeepParamRefs(
+              raw as any,
+              domainKeySet,
+              eventShape,
+            );
+            allComposerWarnings.push(...deepCorrections);
           } else {
             if (raw.params && Object.keys(raw.params).length > 0) {
               allComposerWarnings.push(
                 `[${raw.name}] command workflow — declared params replaced with command-bridge schema.`,
               );
             }
-            effectiveParams = COMMAND_BRIDGE_PARAMS;
+            if (raw.persistence?.stateParam) {
+              effectiveParams = {
+                ...COMMAND_BRIDGE_PARAMS,
+                properties: {
+                  ...(COMMAND_BRIDGE_PARAMS.properties as Record<
+                    string,
+                    unknown
+                  >),
+                  [(raw.persistence as { stateParam: string }).stateParam]: {
+                    type: "object",
+                    description: "Persisted state",
+                  },
+                },
+              };
+            } else {
+              effectiveParams = COMMAND_BRIDGE_PARAMS;
+            }
           }
 
           const result = composeWorkflowDefinition({
@@ -508,6 +651,26 @@ server.registerTool(
         );
       }
 
+      // Levenshtein helper for fuzzy operationId matching in generate
+      const lev = (a: string, b: string): number => {
+        const m = a.length,
+          n = b.length;
+        if (m === 0) return n;
+        if (n === 0) return m;
+        let prev = Array.from({ length: n + 1 }, (_, i) => i);
+        for (let i = 1; i <= m; i++) {
+          const curr = [i];
+          for (let j = 1; j <= n; j++) {
+            curr[j] =
+              a[i - 1] === b[j - 1]
+                ? prev[j - 1]
+                : 1 + Math.min(prev[j - 1], prev[j], curr[j - 1]);
+          }
+          prev = curr;
+        }
+        return prev[n];
+      };
+
       const resolvedIds = new Set(endpoints.map((ep) => ep.operationId));
       const unresolvedErrors: string[] = [];
       for (const wf of workflowDefs) {
@@ -515,23 +678,41 @@ server.registerTool(
           if (step.config.type === "api_call") {
             const cfg = step.config as { operationId: string };
             if (!resolvedIds.has(cfg.operationId)) {
-              const suggestions = [...resolvedIds]
-                .filter((id) => {
-                  const norm = normalize(cfg.operationId);
-                  const normId = normalize(id);
-                  return (
-                    normId.includes(norm.split("-").slice(-1)[0]) ||
-                    norm.includes(normId.split("-").slice(-1)[0])
-                  );
-                })
-                .slice(0, 3);
-              const hint =
-                suggestions.length > 0
-                  ? ` Did you mean: ${suggestions.join(", ")}?`
-                  : " Use get_endpoint_schemas to verify operationIds.";
-              unresolvedErrors.push(
-                `Workflow "${wf.name}", step "${step.id}": operationId "${cfg.operationId}" not found in any RC API spec.${hint}`,
-              );
+              // Tier 3: Levenshtein fuzzy match (distance ≤ 2)
+              const normCfg = normalize(cfg.operationId).replace(/[_-]/g, "");
+              let bestMatch = "";
+              let bestDist = 3; // threshold + 1
+              for (const id of resolvedIds) {
+                const d = lev(normCfg, normalize(id).replace(/[_-]/g, ""));
+                if (d < bestDist) {
+                  bestDist = d;
+                  bestMatch = id;
+                }
+              }
+              if (bestMatch) {
+                allComposerWarnings.push(
+                  `[${wf.name}] Auto-corrected operationId: "${cfg.operationId}" → "${bestMatch}" (Levenshtein distance ${bestDist})`,
+                );
+                cfg.operationId = bestMatch;
+              } else {
+                const suggestions = [...resolvedIds]
+                  .filter((id) => {
+                    const norm = normalize(cfg.operationId);
+                    const normId = normalize(id);
+                    return (
+                      normId.includes(norm.split("-").slice(-1)[0]) ||
+                      norm.includes(normId.split("-").slice(-1)[0])
+                    );
+                  })
+                  .slice(0, 3);
+                const hint =
+                  suggestions.length > 0
+                    ? ` Did you mean: ${suggestions.join(", ")}?`
+                    : " Use get_endpoint_schemas to verify operationIds.";
+                unresolvedErrors.push(
+                  `Workflow "${wf.name}", step "${step.id}": operationId "${cfg.operationId}" not found in any RC API spec.${hint}`,
+                );
+              }
             }
           }
         }
@@ -624,8 +805,9 @@ server.registerTool(
           const unknown = [...mappingKeys].filter((k) => !schemaFields.has(k));
           if (unknown.length > 0) {
             const expected = [...schemaFields].join(", ");
-            validationErrors.push(
-              `Workflow "${wf.name}", step "${step.id}": field(s) [${unknown.join(", ")}] not found in ${cfg.operationId} schema. Expected fields: ${expected}`,
+            allComposerWarnings.push(
+              `[${wf.name}] Step "${step.id}": field(s) [${unknown.join(", ")}] not in ${cfg.operationId} schema (expected: ${expected}). ` +
+                `Unknown fields are passed through — the API will ignore them.`,
             );
           }
 
@@ -880,24 +1062,28 @@ server.registerTool(
 
       const tree = treeLines.filter(Boolean).join("\n  ");
 
-      const summaryParts = [
-        `Project "${projectName}" created at: ${projectDir}`,
+      // Build detailed notes for the user (written to file)
+      const detailParts = [
+        `# Generation Notes — ${projectName}`,
         ``,
-        `Workflows:`,
+        `**Created at:** ${projectDir}`,
+        ``,
+        `## Workflows`,
         wfTable,
         ``,
+        `## Project Structure`,
         `  ${tree}`,
         ``,
-        `MCP Server:`,
+        `## MCP Server`,
         `  Workflow tools: ${workflowDefs.length}`,
         `  Capabilities: tools${wfFeatures.map((f) => `, ${f}`).join("")}`,
         `  Files: ${Object.keys(mcpFiles).length}`,
       ];
 
       if (rcAppResult) {
-        summaryParts.push(
+        detailParts.push(
           ``,
-          `RC App (bridged to MCP Server):`,
+          `## RC App (bridged to MCP Server)`,
           `  Event interfaces: ${rcAppResult.eventInterfaces.join(", ") || "none"}`,
           `  Slash commands: ${rcAppResult.commands.join(", ") || "none"}`,
           `  Webhooks: ${rcAppResult.webhooks.join(", ") || "none"}`,
@@ -906,33 +1092,43 @@ server.registerTool(
       }
 
       if (geminiLinked) {
-        summaryParts.push(
+        detailParts.push(
           ``,
-          `Gemini CLI:`,
+          `## Gemini CLI`,
           `  ✓ Auto-registered as "${projectName.replace(/_/g, "-")}" in ~/.gemini/settings.json`,
           `  The MCP server will be available as a Gemini CLI tool on next session.`,
         );
       }
 
-      summaryParts.push(
+      detailParts.push(
         ``,
-        `Setup:`,
+        `## Setup`,
         `  ✓ .env pre-populated from .env.example`,
         `  Run \`npm install\` in mcp-server/${rcAppResult ? " and rc-app/" : ""}`,
       );
 
       if (allComposerWarnings.length > 0) {
-        summaryParts.push(
+        detailParts.push(
           ``,
-          `ℹ️  Composer Notes (${allComposerWarnings.length} — all auto-resolved, no action needed):`,
+          `## Composer Notes (${allComposerWarnings.length} — all auto-resolved, no action needed)`,
+          ...allComposerWarnings.map((w) => `- ${w}`),
         );
-        for (const w of allComposerWarnings) {
-          summaryParts.push(`  ${w}`);
-        }
       }
 
+      // Write full details to GENERATION_NOTES.md for the user
+      writeFileSync(
+        join(projectDir, "GENERATION_NOTES.md"),
+        detailParts.join("\n"),
+        "utf-8",
+      );
+
+      // Return terse summary to LLM to avoid post-generate echoing
+      const totalFiles =
+        Object.keys(mcpFiles).length + (rcAppResult?.filesWritten ?? 0) + 1; // +1 for GENERATION_NOTES.md
+      const terseSummary = `Success. Project "${projectName}" generated at ${projectDir}. ${workflowDefs.length} workflows, ${totalFiles} files. See GENERATION_NOTES.md for setup and details.`;
+
       return {
-        content: [{ type: "text" as const, text: summaryParts.join("\n") }],
+        content: [{ type: "text" as const, text: terseSummary }],
       };
     } catch (err) {
       return {

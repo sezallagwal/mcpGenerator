@@ -1519,6 +1519,242 @@ describe("generateBridgedEventHandlerCode with persistence", () => {
   });
 });
 
+describe("generateSlashCommandCode with persistence", () => {
+  const cmdWorkflow: WorkflowDefinition = {
+    name: "resolve_incident",
+    description: "Resolve an incident",
+    command: "resolve",
+    params: {
+      type: "object",
+      properties: {
+        room: { type: "object" },
+        sender: { type: "object" },
+        query: { type: "string" },
+        incidentState: { type: "object", description: "Persisted state" },
+      },
+    },
+    steps: [
+      {
+        id: "check",
+        label: "Check",
+        config: {
+          type: "conditional",
+          condition:
+            "params.incidentState && params.incidentState.status === 'open'",
+          thenStep: "resolve",
+        },
+      },
+      {
+        id: "resolve",
+        label: "Resolve",
+        config: {
+          type: "transform",
+          expression: "({ ...params.incidentState, status: 'resolved' })",
+        },
+        dependsOn: ["check"],
+      },
+      {
+        id: "confirm",
+        label: "Confirm",
+        config: {
+          type: "api_call",
+          operationId: "post-api-v1-chat_sendMessage",
+          inputMapping: {
+            message: { msg: "Resolved.", rid: "{{params.room.id}}" },
+          },
+        },
+        dependsOn: ["resolve"],
+      },
+    ],
+    requiredEndpoints: ["post-api-v1-chat_sendMessage"],
+    usesSampling: false,
+    usesElicitation: false,
+    persistence: {
+      model: "room",
+      keyPath: "room.id",
+      stateParam: "incidentState",
+      defaultState: { status: "closed", severity: "unknown" },
+      updateFromStep: "resolve",
+    },
+  };
+
+  it("imports RocketChatAssociationModel when persistence is set", () => {
+    const code = generateSlashCommandCode(
+      {
+        command: "resolve",
+        description: "Resolve incident",
+        workflowName: "resolve_incident",
+      },
+      cmdWorkflow,
+    );
+    assert.ok(
+      code.includes("RocketChatAssociationModel"),
+      "Should import RocketChatAssociationModel",
+    );
+    assert.ok(
+      code.includes("RocketChatAssociationRecord"),
+      "Should import RocketChatAssociationRecord",
+    );
+    assert.ok(
+      code.includes("@rocket.chat/apps-engine/definition/metadata"),
+      "Should import from metadata",
+    );
+  });
+
+  it("reads persisted state before bridge call", () => {
+    const code = generateSlashCommandCode(
+      {
+        command: "resolve",
+        description: "Resolve incident",
+        workflowName: "resolve_incident",
+      },
+      cmdWorkflow,
+    );
+    assert.ok(code.includes("getPersistenceReader"), "Should read persistence");
+    assert.ok(
+      code.includes("readByAssociation"),
+      "Should use readByAssociation",
+    );
+    assert.ok(code.includes("room.id"), "Should use keyPath for persist key");
+    assert.ok(
+      code.includes("RocketChatAssociationModel.ROOM"),
+      "Should use ROOM model",
+    );
+  });
+
+  it("injects stateParam into toolArgs", () => {
+    const code = generateSlashCommandCode(
+      {
+        command: "resolve",
+        description: "Resolve incident",
+        workflowName: "resolve_incident",
+      },
+      cmdWorkflow,
+    );
+    assert.ok(
+      code.includes("toolArgs.incidentState = incidentState"),
+      "Should inject stateParam into toolArgs",
+    );
+  });
+
+  it("uses default state when no record exists", () => {
+    const code = generateSlashCommandCode(
+      {
+        command: "resolve",
+        description: "Resolve incident",
+        workflowName: "resolve_incident",
+      },
+      cmdWorkflow,
+    );
+    assert.ok(
+      code.includes('"status":"closed"'),
+      "Should include default state",
+    );
+  });
+
+  it("writes back updated state when updateFromStep is set", () => {
+    const code = generateSlashCommandCode(
+      {
+        command: "resolve",
+        description: "Resolve incident",
+        workflowName: "resolve_incident",
+      },
+      cmdWorkflow,
+    );
+    assert.ok(
+      code.includes("updateByAssociation"),
+      "Should write back updated state",
+    );
+    assert.ok(
+      code.includes("createWithAssociation"),
+      "Should create state if first time",
+    );
+    assert.ok(
+      code.includes('"resolve"'),
+      "Should reference the updateFromStep",
+    );
+    assert.ok(
+      code.includes("stepEntry?.status === 'success'"),
+      "Should check step status before persisting",
+    );
+  });
+
+  it("does not generate persistence code when workflow has no persistence", () => {
+    const code = generateSlashCommandCode(
+      { command: "test", description: "Test", workflowName: "test_workflow" },
+      testWorkflow,
+    );
+    assert.ok(
+      !code.includes("RocketChatAssociationModel"),
+      "Should NOT import persistence types",
+    );
+    assert.ok(
+      !code.includes("readByAssociation"),
+      "Should NOT have persistence reading code",
+    );
+  });
+
+  it("does not generate write-back when updateFromStep is omitted", () => {
+    const readOnlyWorkflow: WorkflowDefinition = {
+      ...cmdWorkflow,
+      persistence: {
+        model: "room",
+        keyPath: "room.id",
+        stateParam: "incidentState",
+        defaultState: { status: "closed" },
+      },
+    };
+    const code = generateSlashCommandCode(
+      {
+        command: "resolve",
+        description: "Resolve incident",
+        workflowName: "resolve_incident",
+      },
+      readOnlyWorkflow,
+    );
+    assert.ok(
+      code.includes("readByAssociation"),
+      "Should still read persistence",
+    );
+    assert.ok(
+      !code.includes("updateByAssociation"),
+      "Should NOT write back without updateFromStep",
+    );
+    assert.ok(
+      !code.includes("createWithAssociation"),
+      "Should NOT create without updateFromStep",
+    );
+  });
+
+  it("uses USER model for user-keyed persistence", () => {
+    const userKeyedWorkflow: WorkflowDefinition = {
+      ...cmdWorkflow,
+      persistence: {
+        model: "user",
+        keyPath: "sender.username",
+        stateParam: "userState",
+        defaultState: { count: 0 },
+      },
+    };
+    const code = generateSlashCommandCode(
+      {
+        command: "resolve",
+        description: "Resolve incident",
+        workflowName: "resolve_incident",
+      },
+      userKeyedWorkflow,
+    );
+    assert.ok(
+      code.includes("RocketChatAssociationModel.USER"),
+      "Should use USER model for user-keyed persistence",
+    );
+    assert.ok(
+      code.includes("sender.username"),
+      "Should use sender.username as persist key",
+    );
+  });
+});
+
 describe("Bug 2: event-bound workflow slash command filtering", () => {
   let tmpDir: string;
 

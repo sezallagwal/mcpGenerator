@@ -194,6 +194,11 @@ export function generateSlashCommandCode(
         await modify.getCreator().finish(msg);`;
   }
 
+  const hasPersistence = !!workflow?.persistence;
+  const metadataImport = hasPersistence
+    ? `\nimport { RocketChatAssociationModel, RocketChatAssociationRecord } from '@rocket.chat/apps-engine/definition/metadata';`
+    : "";
+
   return `/**
  * Slash Command: /${cmd.command}
  * ${esc(cmd.description)}
@@ -212,7 +217,7 @@ import {
     SlashCommandContext,
 } from '@rocket.chat/apps-engine/definition/slashcommands';
 import { App } from '@rocket.chat/apps-engine/definition/App';
-import { McpBridge } from '../bridge/mcp-bridge';
+import { McpBridge } from '../bridge/mcp-bridge';${metadataImport}
 
 export class ${className} implements ISlashCommand {
     public command = '${esc(cmd.command)}';
@@ -314,6 +319,38 @@ function generateBridgedCommandBody(workflow: WorkflowDefinition): string {
   lines.push(`            toolArgs.threadId = _threadId || statusMsgId;`);
   lines.push(`            const _triggerId = context.getTriggerId();`);
   lines.push(`            if (_triggerId) toolArgs.triggerId = _triggerId;`);
+
+  // ── Persistence: read state and inject into toolArgs ──
+  const persistence = workflow.persistence;
+  if (persistence) {
+    const modelLiteral = {
+      user: "RocketChatAssociationModel.USER",
+      room: "RocketChatAssociationModel.ROOM",
+      misc: "RocketChatAssociationModel.MISC",
+    }[persistence.model];
+    const keyAccess = persistence.keyPath; // already normalized — commands have room/sender in scope
+    const defaultJson = JSON.stringify(persistence.defaultState);
+
+    lines.push(``);
+    lines.push(`            // Read persisted state`);
+    lines.push(`            const persistKey = ${keyAccess};`);
+    lines.push(`            const assoc = new RocketChatAssociationRecord(`);
+    lines.push(`                ${modelLiteral},`);
+    lines.push(`                String(persistKey),`);
+    lines.push(`            );`);
+    lines.push(
+      `            const records = await read.getPersistenceReader().readByAssociation(assoc);`,
+    );
+    lines.push(
+      `            const ${persistence.stateParam} = records.length > 0`,
+    );
+    lines.push(`                ? (records[0] as Record<string, unknown>)`);
+    lines.push(`                : ${defaultJson};`);
+    lines.push(
+      `            toolArgs.${persistence.stateParam} = ${persistence.stateParam};`,
+    );
+  }
+
   lines.push(
     `            const result = await bridge.callTool('${esc(workflow.name)}', toolArgs);`,
   );
@@ -371,6 +408,49 @@ function generateBridgedCommandBody(workflow: WorkflowDefinition): string {
     lines.push(`                await modify.getCreator().finish(errMsg);`);
     lines.push(`            }`);
   }
+
+  // ── Persistence: write back updated state ──
+  if (persistence?.updateFromStep) {
+    const stepId = persistence.updateFromStep;
+    lines.push(``);
+    lines.push(`            // Update persisted state from workflow result`);
+    lines.push(
+      `            if (result.status === 'success' && result.content) {`,
+    );
+    lines.push(`                try {`);
+    lines.push(
+      `                    const stepResults = JSON.parse(result.content);`,
+    );
+    lines.push(
+      `                    const stepEntry = stepResults[${JSON.stringify(stepId)}];`,
+    );
+    lines.push(
+      `                    if (stepEntry?.status === 'success' && stepEntry.result !== undefined) {`,
+    );
+    lines.push(
+      `                        const updatedState = stepEntry.result;`,
+    );
+    lines.push(`                        if (records.length > 0) {`);
+    lines.push(
+      `                            await persis.updateByAssociation(assoc, updatedState);`,
+    );
+    lines.push(`                        } else {`);
+    lines.push(
+      `                            await persis.createWithAssociation(updatedState, assoc);`,
+    );
+    lines.push(`                        }`);
+    lines.push(
+      `                        logger.info('[Command] Persisted state updated from step "${esc(stepId)}"');`,
+    );
+    lines.push(`                    }`);
+    lines.push(`                } catch (e) {`);
+    lines.push(
+      `                    logger.error('[Command] Failed to update persisted state:', e);`,
+    );
+    lines.push(`                }`);
+    lines.push(`            }`);
+  }
+
   return lines.join("\n");
 }
 
@@ -1400,6 +1480,13 @@ function generateBridgedBody(
 
   if (persistenceConfig?.updateFromStep) {
     const stepId = persistenceConfig.updateFromStep;
+    const writeKeyFrom = persistenceConfig.writeKeyFrom;
+
+    // If writeKeyFrom is set, extract the field path after "<stepId>."
+    const writeKeyField = writeKeyFrom
+      ? writeKeyFrom.slice(stepId.length + 1)
+      : null;
+
     lines.push(
       ``,
       `        // ${nextStepNum}. Update persisted state from workflow result`,
@@ -1409,12 +1496,53 @@ function generateBridgedBody(
       `                const stepEntry = stepResults[${JSON.stringify(stepId)}];`,
       `                if (stepEntry?.status === 'success' && stepEntry.result !== undefined) {`,
       `                    const updatedState = stepEntry.result;`,
-      `                    if (records.length > 0) {`,
-      `                        await this.persistence.updateByAssociation(assoc, updatedState);`,
-      `                    } else {`,
-      `                        await this.persistence.createWithAssociation(updatedState, assoc);`,
-      `                    }`,
-      `                    logger.info('[Bridge] Persisted state updated from step "${stepId}"');`,
+    );
+
+    if (writeKeyField) {
+      // Derive write key from step result field and create a new association
+      const fieldAccess = writeKeyField
+        .split(".")
+        .map((f) => `[${JSON.stringify(f)}]`)
+        .join("");
+      const modelEnum =
+        persistenceConfig.model === "room"
+          ? "RocketChatAssociationModel.ROOM"
+          : persistenceConfig.model === "user"
+            ? "RocketChatAssociationModel.USER"
+            : "RocketChatAssociationModel.MISC";
+      lines.push(
+        `                    const writeKey = updatedState${fieldAccess};`,
+        `                    if (writeKey) {`,
+        `                        const writeAssoc = new RocketChatAssociationRecord(${modelEnum}, String(writeKey));`,
+        `                        const existingRecords = await this.persistence.readByAssociation(writeAssoc);`,
+        `                        if (existingRecords.length > 0) {`,
+        `                            await this.persistence.updateByAssociation(writeAssoc, updatedState);`,
+        `                        } else {`,
+        `                            await this.persistence.createWithAssociation(updatedState, writeAssoc);`,
+        `                        }`,
+        `                        logger.info('[Bridge] Persisted state written with key from "${writeKeyFrom}":', String(writeKey));`,
+        `                    } else {`,
+        `                        // Fallback to read key if write key is null`,
+        `                        if (records.length > 0) {`,
+        `                            await this.persistence.updateByAssociation(assoc, updatedState);`,
+        `                        } else {`,
+        `                            await this.persistence.createWithAssociation(updatedState, assoc);`,
+        `                        }`,
+        `                        logger.info('[Bridge] Persisted state updated from step "${stepId}" (write key was null, used read key)');`,
+        `                    }`,
+      );
+    } else {
+      lines.push(
+        `                    if (records.length > 0) {`,
+        `                        await this.persistence.updateByAssociation(assoc, updatedState);`,
+        `                    } else {`,
+        `                        await this.persistence.createWithAssociation(updatedState, assoc);`,
+        `                    }`,
+        `                    logger.info('[Bridge] Persisted state updated from step "${stepId}"');`,
+      );
+    }
+
+    lines.push(
       `                }`,
       `            } catch (e) {`,
       `                logger.error('[Bridge] Failed to update persisted state:', e);`,
