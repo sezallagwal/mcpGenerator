@@ -132,7 +132,8 @@ export function resolveTemplate(
 ): string {
   const cleaned = template
     .replace(/\{\{\[params\.([^\]]+)\]\}\}/g, "{{params.$1}}")
-    .replace(/\{\{\[steps\.([^\]]+)\]\}\}/g, "{{steps.$1}}");
+    .replace(/\{\{\[steps\.([^\]]+)\]\}\}/g, "{{steps.$1}}")
+    .replace(/\{{3,}([^}]+)\}{3,}/g, "{{$1}}");
 
   const { argNames: scopeNames, argValues: scopeValues } = buildJsScope(
     params,
@@ -258,7 +259,25 @@ interface ExecutionState {
   skipStep: string | null;
   stepDeps: Record<string, string[]>;
   deferredActions: DeferredAction[];
-  botUsernames: Set<string>;
+  conditionalSkips: Record<
+    string,
+    { conditional: string; runningBranchStep: string | null }
+  >;
+}
+
+function hasAncestor(
+  stepId: string,
+  ancestor: string,
+  stepDeps: Record<string, string[]>,
+  visited: Set<string> = new Set(),
+): boolean {
+  if (stepId === ancestor) return true;
+  if (visited.has(stepId)) return false;
+  visited.add(stepId);
+  for (const dep of stepDeps[stepId] || []) {
+    if (hasAncestor(dep, ancestor, stepDeps, visited)) return true;
+  }
+  return false;
 }
 
 export function shouldRun(stepId: string, state: ExecutionState): boolean {
@@ -282,6 +301,24 @@ export function shouldRun(stepId: string, state: ExecutionState): boolean {
       state.completedSteps.includes(d) || state.stepStatus[d] === "skipped",
   );
   if (!allTerminal) return false;
+  // Phase 1.5: Propagate skips from branch-exclusive dependencies
+  for (const dep of deps) {
+    if (state.stepStatus[dep] !== "skipped") continue;
+    const skipInfo = state.conditionalSkips[dep];
+    if (!skipInfo) continue;
+    const { runningBranchStep } = skipInfo;
+    if (
+      runningBranchStep &&
+      hasAncestor(stepId, runningBranchStep, state.stepDeps)
+    ) {
+      continue; // convergence point — running branch feeds into this step
+    }
+    // branch-exclusive: propagate skip
+    state.conditionalSkips[stepId] = skipInfo;
+    state.stepResults[stepId] = null;
+    state.stepStatus[stepId] = "skipped";
+    return false;
+  }
   // Phase 2: Skip only when ALL deps were skipped (no useful input)
   if (deps.length > 0 && deps.every((d) => state.stepStatus[d] === "skipped")) {
     state.stepResults[stepId] = null;
@@ -290,36 +327,6 @@ export function shouldRun(stepId: string, state: ExecutionState): boolean {
   }
   // Phase 3: At least one dep succeeded — run this step
   return true;
-}
-
-// ── Bot message filtering ─────────────────────────────────────────────────
-// Search/read endpoints return { messages: [...] } where each message has
-// .u.username. To prevent the bot's own messages from polluting its own
-// search results (e.g. "⏳ Running /kb ..." appearing in chat_search), we
-// strip messages authored by any of the bot's known identities.
-const MESSAGE_READ_OPS =
-  /chat[._-](search|getPinnedMessages|getStarredMessages|getMentionedMessages|getThreadMessages)|channels[._-](history|messages)|groups[._-](history|messages)|im[._-](history|messages)/;
-
-export function filterBotMessages(
-  result: unknown,
-  botUsernames: Set<string>,
-): unknown {
-  if (!botUsernames.size || typeof result !== "object" || result === null)
-    return result;
-
-  const obj = result as Record<string, unknown>;
-  if (Array.isArray(obj.messages)) {
-    obj.messages = (obj.messages as Array<Record<string, any>>).filter(
-      (m) => !botUsernames.has(m?.u?.username),
-    );
-  }
-  return result;
-}
-
-export function shouldFilterBotMessages(
-  operationId: string | undefined,
-): boolean {
-  return !!operationId && MESSAGE_READ_OPS.test(operationId);
 }
 
 // ── Message size safety ───────────────────────────────────────────────────
@@ -435,11 +442,11 @@ const MSG_CHANNEL_ERROR_RE =
 const MSG_POST_OPS = /chat[._-](postMessage|sendMessage)/;
 
 // ── Channel access helpers ────────────────────────────────────────────────
-// These handle the full lifecycle: create if needed → bot joins → invite members.
+// These handle the full lifecycle: create if needed → join → invite members.
 // Used both by the channels_create duplicate handler and the message-posting
 // auto-recovery, so the logic is in one place.
 
-async function botJoinChannel(roomId: string, client: any): Promise<void> {
+async function joinChannel(roomId: string, client: any): Promise<void> {
   try {
     await client.request("POST", "/api/v1/channels.join", {
       auth: true,
@@ -691,8 +698,8 @@ async function executeSingleApiCall(
           const roomId = await resolveRoomId(name, client);
           if (roomId) {
             const isGroup = ep?.path?.includes("groups.");
-            // Bot must be a member to post later
-            await botJoinChannel(roomId, client);
+            // Must be a member to post later
+            await joinChannel(roomId, client);
             await inviteMembers(roomId, members, !!isGroup, client);
             const infoEndpoint = isGroup
               ? `/api/v1/groups.info?roomId=${encodeURIComponent(roomId)}`
@@ -736,18 +743,13 @@ async function executeSingleApiCall(
           const parsed = step.outputPath
             ? extractPath(mirrorResult, step.outputPath)
             : parseResult(mirrorResult);
-          if (
-            state.botUsernames.size &&
-            shouldFilterBotMessages(step.operationId)
-          )
-            filterBotMessages(parsed, state.botUsernames);
           return parsed;
         }
       } catch {}
     }
 
     // ── Message-post auto-recovery ──────────────────────────────────────
-    // If chat.postMessage / chat.sendMessage fails because the bot isn't
+    // If chat.postMessage / chat.sendMessage fails because the user isn't
     // in the target channel, try to join (or create) it and retry once.
     if (
       step.operationId &&
@@ -792,7 +794,7 @@ async function executeSingleApiCall(
           }
 
           if (roomId) {
-            await botJoinChannel(roomId, client);
+            await joinChannel(roomId, client);
             // Retry the original request
             const retryResult = await client.request(method, path, {
               auth: true,
@@ -815,8 +817,6 @@ async function executeSingleApiCall(
   const parsed = step.outputPath
     ? extractPath(result, step.outputPath)
     : parseResult(result);
-  if (state.botUsernames.size && shouldFilterBotMessages(step.operationId))
-    filterBotMessages(parsed, state.botUsernames);
   return parsed;
 }
 
@@ -1343,10 +1343,18 @@ function executeConditional(step: StepDefinition, state: ExecutionState): void {
   if (conditionResult) {
     if (step.elseStep) {
       state.skipStep = step.elseStep;
+      state.conditionalSkips[step.elseStep] = {
+        conditional: step.id,
+        runningBranchStep: step.thenStep || null,
+      };
     }
   } else {
     if (step.thenStep) {
       state.skipStep = step.thenStep;
+      state.conditionalSkips[step.thenStep] = {
+        conditional: step.id,
+        runningBranchStep: step.elseStep || null,
+      };
     }
   }
 
@@ -1359,7 +1367,6 @@ export interface WorkflowEngineOptions {
   endpoints: Record<string, EndpointInfo>;
   name: string;
   extra?: any;
-  botUsernames?: string[];
 }
 
 export async function runWorkflow(
@@ -1367,7 +1374,7 @@ export async function runWorkflow(
   steps: StepDefinition[],
   args: Record<string, unknown>,
 ): Promise<ToolResult> {
-  const { server, client, endpoints, name, extra, botUsernames } = options;
+  const { server, client, endpoints, name, extra } = options;
 
   const state: ExecutionState = {
     params: args,
@@ -1379,7 +1386,7 @@ export async function runWorkflow(
     skipStep: null,
     stepDeps: Object.fromEntries(steps.map((s) => [s.id, s.dependsOn || []])),
     deferredActions: [],
-    botUsernames: new Set(botUsernames ?? []),
+    conditionalSkips: {},
   };
 
   const log = (msg: string) => console.error(`[${name}] ${msg}`);
@@ -1431,6 +1438,45 @@ export async function runWorkflow(
   const mustRunAlone = (type: string) =>
     type === "conditional" || type === "elicitation";
 
+  // ── Destructive-op deferral (Bug 2 fix) ──────────────────────────────────
+  // Destructive operations (archive, delete, close) that share room references
+  // with non-destructive remaining steps are deferred to prevent race conditions.
+  const DESTRUCTIVE_OPS =
+    /channels[._-](archive|delete|close)|groups[._-](archive|delete|close)/;
+
+  function isDestructive(step: StepDefinition): boolean {
+    return !!(step.operationId && DESTRUCTIVE_OPS.test(step.operationId));
+  }
+
+  function getRoomRefs(step: StepDefinition): Set<string> {
+    const refs = new Set<string>();
+    if (!step.inputMapping) return refs;
+    for (const key of ["roomId", "rid", "channel"] as const) {
+      const val = step.inputMapping[key];
+      if (typeof val === "string" && val.length > 0) refs.add(val);
+    }
+    // Also check nested: message.rid
+    const msg = step.inputMapping.message;
+    if (msg && typeof msg === "object" && (msg as any).rid) {
+      const rid = (msg as any).rid;
+      if (typeof rid === "string") refs.add(rid);
+    }
+    return refs;
+  }
+
+  function hasOverlappingRooms(
+    a: StepDefinition,
+    b: StepDefinition,
+  ): boolean {
+    const refsA = getRoomRefs(a);
+    const refsB = getRoomRefs(b);
+    if (refsA.size === 0 || refsB.size === 0) return false;
+    for (const ref of refsA) {
+      if (refsB.has(ref)) return true;
+    }
+    return false;
+  }
+
   try {
     const remaining = new Set(steps.map((s) => s.id));
     const stepById = new Map(steps.map((s) => [s.id, s]));
@@ -1465,7 +1511,35 @@ export async function runWorkflow(
       }
 
       const soloStep = ready.find((s) => mustRunAlone(s.type));
-      const batch = soloStep ? [soloStep] : ready;
+      let batch: StepDefinition[];
+      if (soloStep) {
+        batch = [soloStep];
+      } else {
+        // Defer destructive ops that have overlapping room refs with
+        // non-destructive remaining steps (prevents archive racing with post)
+        const deferred = new Set<string>();
+        for (const step of ready) {
+          if (!isDestructive(step)) continue;
+          for (const otherId of remaining) {
+            if (otherId === step.id) continue;
+            const other = stepById.get(otherId)!;
+            if (isDestructive(other)) continue; // destructive vs destructive = OK
+            if (hasOverlappingRooms(step, other)) {
+              deferred.add(step.id);
+              log(
+                `[${step.id}] DEFERRED (destructive op, room overlap with ${otherId})`,
+              );
+              break;
+            }
+          }
+        }
+        batch =
+          deferred.size > 0
+            ? ready.filter((s) => !deferred.has(s.id))
+            : ready;
+        // If ALL ready steps were deferred (shouldn't happen with V2), run them anyway
+        if (batch.length === 0) batch = ready;
+      }
 
       await sendProgress(
         state.completedSteps.length,

@@ -7,18 +7,14 @@ import type {
   ElicitationStep,
   TransformStep,
   ConditionalStep,
-  PersistenceConfig,
 } from "./types.js";
 import type { JSONSchema7 } from "json-schema";
 
 export interface ComposeWorkflowInput {
   name: string;
   description: string;
-  triggerEvent?: string;
-  command?: string;
   params: JSONSchema7;
   steps: ComposeStepInput[];
-  persistence?: PersistenceConfig;
 }
 
 export interface ComposeStepInput {
@@ -49,7 +45,9 @@ export interface ComposerWarning {
     | "FIELD_STRIPPED"
     | "FIELD_AUTO_SET"
     | "OUTPUT_PATH_INFERRED"
-    | "OUTPUT_PATH_REF_FIXED";
+    | "OUTPUT_PATH_REF_FIXED"
+    | "EVENT_PARAM_SHORTHAND"
+    | "STRINGIFIED_JSON_PARSED";
   message: string;
 }
 
@@ -1138,120 +1136,6 @@ function rewriteDeep(value: unknown, re: RegExp): unknown {
   return value;
 }
 
-function validatePersistenceConfig(
-  persistence: PersistenceConfig,
-  steps: ComposeStepInput[],
-): ComposerWarning[] {
-  const warnings: ComposerWarning[] = [];
-  const stepIds = new Set(steps.map((s) => s.id));
-
-  if (!persistence.keyPath || persistence.keyPath.trim() === "") {
-    throw new ComposerError(
-      'Persistence keyPath is required (e.g. "sender.username" for per-user state)',
-    );
-  }
-
-  // Strip "params." prefix — keyPath is domain-relative ("room.id"), not engine-scoped ("params.room.id")
-  let normalizedKeyPath = persistence.keyPath.trim();
-  if (normalizedKeyPath.startsWith("params.")) {
-    normalizedKeyPath = normalizedKeyPath.slice(7);
-  }
-  if (!/^[a-zA-Z_$]\w*(?:\.[a-zA-Z_$]\w*)*$/.test(normalizedKeyPath)) {
-    throw new ComposerError(
-      `Persistence keyPath "${persistence.keyPath}" is not a valid dotted property path ` +
-        `(e.g. "room.id", "sender.username")`,
-    );
-  }
-  persistence.keyPath = normalizedKeyPath;
-
-  if (
-    !persistence.stateParam ||
-    !/^[a-zA-Z_]\w*$/.test(persistence.stateParam)
-  ) {
-    throw new ComposerError(
-      `Invalid persistence stateParam "${persistence.stateParam}": must be a valid identifier`,
-    );
-  }
-
-  if (persistence.updateFromStep) {
-    if (!stepIds.has(persistence.updateFromStep)) {
-      throw new ComposerError(
-        `Persistence updateFromStep "${persistence.updateFromStep}" does not exist. ` +
-          `Available steps: ${[...stepIds].join(", ")}`,
-      );
-    }
-    const updateStep = steps.find((s) => s.id === persistence.updateFromStep);
-    if (updateStep && updateStep.config.type !== "transform") {
-      throw new ComposerError(
-        `Persistence updateFromStep "${persistence.updateFromStep}" is a ${updateStep.config.type} step — ` +
-          `MUST be a transform step. Transform steps produce structured state objects; ` +
-          `${updateStep.config.type} steps do not.`,
-      );
-    }
-  }
-
-  // Warn if stateParam is declared but never referenced in any step template
-  const stateRef = `params.${persistence.stateParam}`;
-  let stateParamUsed = false;
-  for (const step of steps) {
-    const cfg = step.config as Record<string, unknown>;
-    const templates: string[] = [];
-    if (cfg.inputMapping && typeof cfg.inputMapping === "object") {
-      for (const v of Object.values(
-        cfg.inputMapping as Record<string, unknown>,
-      )) {
-        if (typeof v === "string") templates.push(v);
-      }
-    }
-    for (const field of [
-      "prompt",
-      "systemPrompt",
-      "expression",
-      "condition",
-      "message",
-    ]) {
-      if (typeof cfg[field] === "string") templates.push(cfg[field] as string);
-    }
-    if (templates.some((t) => t.includes(stateRef))) {
-      stateParamUsed = true;
-      break;
-    }
-  }
-  if (!stateParamUsed) {
-    warnings.push({
-      stepId: null,
-      code: "DATA_FLOW_WARNING",
-      message:
-        `Persistence stateParam "${persistence.stateParam}" is declared but never referenced in any step. ` +
-        `The loaded state is injected as params.${persistence.stateParam} — use it or remove persistence config.`,
-    });
-  }
-
-  if (persistence.writeKeyFrom) {
-    if (!persistence.updateFromStep) {
-      throw new ComposerError(
-        `Persistence writeKeyFrom "${persistence.writeKeyFrom}" requires updateFromStep to be set — ` +
-          `the write key is extracted from the updateFromStep result.`,
-      );
-    }
-    const parts = persistence.writeKeyFrom.split(".");
-    if (parts.length < 2) {
-      throw new ComposerError(
-        `Persistence writeKeyFrom "${persistence.writeKeyFrom}" must be "<stepId>.<field>" ` +
-          `(e.g. "${persistence.updateFromStep}.channelId").`,
-      );
-    }
-    if (parts[0] !== persistence.updateFromStep) {
-      throw new ComposerError(
-        `Persistence writeKeyFrom "${persistence.writeKeyFrom}" must reference the updateFromStep ` +
-          `"${persistence.updateFromStep}" (got "${parts[0]}").`,
-      );
-    }
-  }
-
-  return warnings;
-}
-
 function normalizeEventParamShorthand(
   steps: ComposeStepInput[],
   params: JSONSchema7,
@@ -1835,15 +1719,7 @@ function flattenNestedSteps(steps: ComposeStepInput[]): ComposerWarning[] {
 export function composeWorkflowDefinition(
   input: ComposeWorkflowInput,
 ): ComposeWorkflowResult {
-  const {
-    name,
-    description,
-    triggerEvent,
-    command,
-    params,
-    steps,
-    persistence,
-  } = input;
+  const { name, description, params, steps } = input;
 
   if (!name || !/^[a-z][a-z0-9_]*$/.test(name)) {
     throw new ComposerError(
@@ -1879,50 +1755,6 @@ export function composeWorkflowDefinition(
 
   detectCycles(steps);
 
-  // Reject event-domain refs (params.message.*, params.context.*) in command workflows with no triggerEvent
-  if (!triggerEvent) {
-    const paramProps = params.properties
-      ? new Set(Object.keys(params.properties))
-      : new Set<string>();
-    const eventOnlyDomains: Array<[string, string]> = [
-      ["message", "params.message."],
-      ["context", "params.context."],
-    ];
-    for (const [domain, prefix] of eventOnlyDomains) {
-      if (paramProps.has(domain)) continue;
-      for (const step of steps) {
-        const cfg = step.config as Record<string, unknown>;
-        const templates: string[] = [];
-        if (cfg.inputMapping && typeof cfg.inputMapping === "object") {
-          for (const v of Object.values(
-            cfg.inputMapping as Record<string, unknown>,
-          )) {
-            if (typeof v === "string") templates.push(v);
-          }
-        }
-        for (const field of [
-          "prompt",
-          "systemPrompt",
-          "expression",
-          "condition",
-          "message",
-        ]) {
-          if (typeof cfg[field] === "string")
-            templates.push(cfg[field] as string);
-        }
-        for (const tmpl of templates) {
-          if (tmpl.includes(prefix)) {
-            throw new ComposerError(
-              `Step "${step.id}" references "${prefix}*" but no triggerEvent is set. ` +
-                `Add triggerEvent (e.g. IPostMessageSent) or use command params ` +
-                `(params.room, params.sender, params.query).`,
-            );
-          }
-        }
-      }
-    }
-  }
-
   const templateRefWarnings = validateTemplateReferences(steps, params);
 
   validateDataFlowTypes(steps);
@@ -1930,10 +1762,6 @@ export function composeWorkflowDefinition(
   const samplingSchemaWarnings = inferSamplingResponseSchemas(steps);
 
   const semanticWarnings = generateSemanticWarnings(steps, params);
-
-  const persistenceWarnings = persistence
-    ? validatePersistenceConfig(persistence, steps)
-    : [];
 
   const allWarnings = [
     ...flattenWarnings,
@@ -1946,7 +1774,6 @@ export function composeWorkflowDefinition(
     ...templateRefWarnings,
     ...samplingSchemaWarnings,
     ...semanticWarnings,
-    ...persistenceWarnings,
   ];
 
   const executionOrder = topologicalSort(steps);
@@ -1975,14 +1802,11 @@ export function composeWorkflowDefinition(
   const workflow: WorkflowDefinition = {
     name,
     description,
-    ...(triggerEvent ? { triggerEvent } : {}),
-    ...(command ? { command } : {}),
     params,
     steps: orderedSteps,
     requiredEndpoints,
     usesSampling,
     usesElicitation,
-    ...(persistence ? { persistence } : {}),
   };
 
   return {

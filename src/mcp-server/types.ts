@@ -57,21 +57,9 @@ export interface WorkflowStep {
 export interface WorkflowDefinition {
   name: string;
   description: string;
-  triggerEvent?: string;
-  command?: string;
   params: JSONSchema7;
   steps: WorkflowStep[];
   requiredEndpoints: string[];
   usesSampling: boolean;
   usesElicitation: boolean;
-  persistence?: PersistenceConfig;
-}
-
-export interface PersistenceConfig {
-  model: "user" | "room" | "misc";
-  keyPath: string;
-  stateParam: string;
-  defaultState: Record<string, unknown>;
-  updateFromStep?: string;
-  writeKeyFrom?: string;
 }

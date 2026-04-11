@@ -2,7 +2,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -32,72 +31,8 @@ import {
 } from "./mcp-server/workflowComposer.js";
 import type { WorkflowDefinition } from "./mcp-server/types.js";
 import { injectEnsureChannelSteps } from "./mcp-server/ensureChannelInjector.js";
-import { generateRcAppProject } from "./rc-app/rcAppGenerator.js";
-import { getCapabilities, resolveEventInfo } from "./rc-app/parser.js";
-import { toPascalCase } from "./utils.js";
-import {
-  formatCapabilityGuide,
-  formatAppEventsGuide,
-} from "./capability-guide.js";
-import {
-  COMMAND_BRIDGE_PARAMS,
-  deriveCommandKeyPath,
-  autoInjectPersistence,
-  autoCorrectEventParamRefs,
-  autoCorrectDeepParamRefs,
-} from "./persistence-helpers.js";
-
-function shapeToJsonSchema(
-  shape: Record<string, unknown>,
-): Record<string, unknown> {
-  const props: Record<string, unknown> = {};
-  for (const [key, val] of Object.entries(shape)) {
-    if (typeof val === "object" && val !== null && !Array.isArray(val)) {
-      props[key.replace(/\?$/, "")] = {
-        type: "object",
-        properties: shapeToJsonSchema(val as Record<string, unknown>),
-      };
-    } else {
-      props[key.replace(/\?$/, "")] = { type: "string" };
-    }
-  }
-  return props;
-}
-
-function deriveEventParamsSchema(
-  eventInterfaceNames: string[],
-  persistence?: { stateParam: string },
-): Record<string, unknown> {
-  const properties: Record<string, unknown> = {};
-  const infoMap = resolveEventInfo(eventInterfaceNames);
-  for (const ifaceName of eventInterfaceNames) {
-    const info = infoMap[ifaceName];
-    if (info && !properties[info.param]) {
-      if (info.shape && typeof info.shape === "object") {
-        properties[info.param] = {
-          type: "object",
-          description: `Event data from ${ifaceName}`,
-          properties: shapeToJsonSchema(info.shape),
-        };
-      } else {
-        properties[info.param] = {
-          type: "object",
-          description: `Event data from ${ifaceName}`,
-        };
-      }
-    }
-  }
-  if (persistence?.stateParam) {
-    properties[persistence.stateParam] = {
-      type: "object",
-      description: "Persisted state",
-    };
-  }
-  return {
-    type: "object" as const,
-    properties,
-  };
-}
+import { formatCapabilityGuide } from "./capability-guide.js";
+import { parseDsl } from "./dsl/parseDsl.js";
 
 function getAcceptedFields(schema: Record<string, unknown>): Set<string> {
   const fields = new Set<string>();
@@ -134,17 +69,16 @@ server.registerTool(
   "get_capability_guide",
   {
     description:
-      "Returns ALL Rocket.Chat API endpoints (with operationIds) and App event interfaces in one guide. " +
+      "Returns ALL Rocket.Chat API endpoints (with operationIds) in one guide. " +
       "This is the discovery tool — call it FIRST. " +
       "API entries show 'summary → operationId' — use operationIds in workflow steps. " +
-      "App Events section lists realtime event interfaces — use them as triggerEvent on individual workflows ('when X happens'). " +
-      "After picking ALL needed operationIds and eventInterfaces, call get_endpoint_schemas ONCE with ALL of them in a single call BEFORE writing workflows.",
+      "After picking ALL needed operationIds, call get_endpoint_schemas ONCE with ALL of them in a single call BEFORE writing workflows.",
     inputSchema: {},
   },
   async () => {
     try {
       const endpoints = await listEndpoints(getAvailableDomains());
-      const guide = formatCapabilityGuide(endpoints) + formatAppEventsGuide();
+      const guide = formatCapabilityGuide(endpoints);
       return {
         content: [{ type: "text" as const, text: guide }],
       };
@@ -169,17 +103,16 @@ server.registerTool(
   "get_endpoint_schemas",
   {
     description:
-      "Get exact request/response schemas and event param shapes for chosen operationIds and eventInterfaces. " +
-      "Call this AFTER get_capability_guide, BEFORE generate. " +
+      "Get exact request/response schemas for chosen operationIds. " +
+      "Call this AFTER get_capability_guide, BEFORE writing your DSL for generate. " +
       "IMPORTANT: Pass ALL operationIds you need in a SINGLE call — do NOT split across multiple calls. There is no limit on array size. " +
       "Returns request body schemas (exact field names for inputMapping) and response shape summaries (for {{steps.X.result.Y}} references). " +
       "If you need both channels_* and groups_* variants, request both explicitly.",
     inputSchema: {
       operationIds: z.array(z.string()),
-      eventInterfaces: z.array(z.string()).optional(),
     },
   },
-  async ({ operationIds, eventInterfaces }) => {
+  async ({ operationIds }) => {
     try {
       const endpoints = await getFullEndpoints(operationIds, undefined, 5);
 
@@ -228,18 +161,6 @@ server.registerTool(
         result.unmatchedOperationIds = unmatched;
       }
 
-      if (eventInterfaces && eventInterfaces.length > 0) {
-        const infoMap = resolveEventInfo(eventInterfaces);
-        const eventShapes: Record<string, Record<string, unknown>> = {};
-        for (const ifaceName of eventInterfaces) {
-          const info = infoMap[ifaceName];
-          if (info?.shape) {
-            eventShapes[ifaceName] = { [info.param]: info.shape };
-          }
-        }
-        result.eventShapes = eventShapes;
-      }
-
       return {
         content: [
           {
@@ -266,298 +187,66 @@ server.registerTool(
   "generate",
   {
     description:
-      "Generate a complete linked project: an MCP Server (workflow tools) and optionally an RC App (realtime event handlers). " +
+      "Generate a complete MCP server project from a DSL definition. " +
       "Each workflow becomes one tool that chains API calls, AI reasoning (sampling), and user confirmation (elicitation). " +
-      "Output: a monorepo under projects/<projectName>/ with mcp-server/ (always) and rc-app/ (if events needed). " +
-      "Call ONCE with ALL workflows complete.",
+      "Output: a project under projects/<projectName>/mcp-server/ with stdio transport. " +
+      "Call ONCE with the complete DSL.",
     inputSchema: {
-      projectName: z.string(),
-      description: z.string(),
-      workflows: z.array(
-        z.object({
-          name: z.string(),
-          description: z.string(),
-          triggerEvent: z
-            .string()
-            .nullable()
-            .optional()
-            .transform((v) => v ?? undefined)
-            .describe(
-              "RC Apps event interface name (e.g. IPostMessageSent). Set this OR command, never both. When set, OMIT params — the engine derives params from the event shape automatically.",
-            ),
-          command: z
-            .string()
-            .nullable()
-            .optional()
-            .transform((v) => v ?? undefined)
-            .describe(
-              "Slash command name WITHOUT leading slash (e.g. 'resolve'). Set this OR triggerEvent, never both. Params are auto-injected: room.{id,type,displayName}, sender.{id,username,name}, query, threadId, triggerId.",
-            ),
-          params: z
-            .record(z.string(), z.any())
-            .nullable()
-            .optional()
-            .transform((v) => v ?? undefined),
-          steps: z.array(
-            z.object({
-              id: z.string(),
-              label: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              type: z.enum([
-                "api_call",
-                "transform",
-                "sampling",
-                "conditional",
-                "elicitation",
-              ]),
-              dependsOn: z
-                .array(z.string())
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              operationId: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              inputMapping: z
-                .record(z.string(), z.any())
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined)
-                .describe(
-                  'Map of field→value. Values MUST be native JSON types (objects, arrays, numbers), NOT pre-stringified JSON strings. Example: {"sort": {"msgs": -1}}, NOT {"sort": "{\\"msgs\\": -1}"}.',
-                ),
-              continueOnError: z
-                .boolean()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              outputPath: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              forEach: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              as: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              prompt: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              systemPrompt: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              maxTokens: z
-                .number()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              message: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              requestedSchema: z
-                .record(z.string(), z.any())
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              expression: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              condition: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              thenStep: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-              elseStep: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined),
-            }),
-          ),
-          persistence: z
-            .object({
-              model: z
-                .enum(["user", "room", "misc"])
-                .describe(
-                  "Scope: 'user' = per-user state, 'room' = per-room state, 'misc' = global state.",
-                ),
-              keyPath: z.string(),
-              stateParam: z
-                .string()
-                .describe(
-                  "Name injected into params holding the loaded state object. Your workflow steps MUST reference this via {{params.<stateParam>}} — if unused, the state serves no purpose.",
-                ),
-              defaultState: z.unknown(),
-              updateFromStep: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined)
-                .describe(
-                  "ID of the transform step whose result becomes the new persisted state. MUST be a transform step (not api_call/sampling).",
-                ),
-              writeKeyFrom: z
-                .string()
-                .nullable()
-                .optional()
-                .transform((v) => v ?? undefined)
-                .describe(
-                  "Dotted path into the updateFromStep result to extract the persistence write key. " +
-                    'Format: "<stepId>.<field>". Used when the event handler writes state for a different room/user ' +
-                    "than it reads from (e.g. writing to a newly created channel's ID instead of the trigger room).",
-                ),
-            })
-            .nullable()
-            .optional()
-            .transform((v) => v ?? undefined),
-        }),
-      ),
-      eventInterfaces: z
-        .array(z.string())
-        .nullable()
-        .optional()
-        .transform((v) => v ?? undefined),
-      webhookEndpoints: z
-        .array(
-          z.object({
-            path: z.string(),
-            description: z.string(),
-            methods: z.array(z.enum(["get", "post"])),
-          }),
-        )
-        .nullable()
-        .optional()
-        .transform((v) => v ?? undefined),
+      dsl: z
+        .string()
+        .describe(
+          "Complete project definition in DSL format. See system instructions for DSL syntax.",
+        ),
     },
   },
-  async ({
-    projectName,
-    description: projectDescription,
-    workflows: rawWorkflows,
-    eventInterfaces: eventInterfaceNames,
-    webhookEndpoints,
-  }) => {
+  async ({ dsl }) => {
     try {
-      if (!rawWorkflows || rawWorkflows.length === 0) {
+      let parsed;
+      try {
+        parsed = parseDsl(dsl);
+      } catch (parseErr) {
         return {
           content: [
             {
               type: "text" as const,
-              text: "Provide at least one workflow via 'workflows'.",
+              text: `DSL parse error: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
             },
           ],
           isError: true,
         };
       }
 
-      const hasEventWorkflows = rawWorkflows.some((wf) => wf.triggerEvent);
-      const hasCommandWorkflows = rawWorkflows.some((wf) => !wf.triggerEvent);
-      const hasWebhooks = !!(webhookEndpoints && webhookEndpoints.length > 0);
-      const needsRcApp =
-        hasEventWorkflows || hasCommandWorkflows || hasWebhooks;
+      const {
+        projectName,
+        description: projectDescription,
+        workflows: rawWorkflows,
+      } = parsed;
 
-      const allComposerWarnings: string[] = [
-        ...autoInjectPersistence(rawWorkflows as any),
-      ];
+      if (!rawWorkflows || rawWorkflows.length === 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Provide at least one workflow in the DSL.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const allComposerWarnings: string[] = [];
 
       const workflowDefs: WorkflowDefinition[] = [];
       for (const raw of rawWorkflows) {
         try {
-          let effectiveParams = raw.params as
-            | Record<string, unknown>
-            | undefined;
-          if (raw.triggerEvent) {
-            const derived = deriveEventParamsSchema(
-              [raw.triggerEvent],
-              raw.persistence as { stateParam: string } | undefined,
-            );
-            if (raw.params && Object.keys(raw.params).length > 0) {
-              allComposerWarnings.push(
-                `[${raw.name}] triggerEvent="${raw.triggerEvent}" — declared params replaced with event-derived schema. ` +
-                  `Handler passes { ${Object.keys((derived as any).properties).join(", ")} }, not the declared schema.`,
-              );
-            }
-            effectiveParams = derived;
-
-            // Auto-correct domain-key skips (params.room → params.message.room)
-            const infoMap = resolveEventInfo([raw.triggerEvent]);
-            const eventShape: Record<string, Record<string, unknown>> = {};
-            for (const [ifName, info] of Object.entries(infoMap)) {
-              if (info.shape && typeof info.shape === "object") {
-                eventShape[info.param] = info.shape as Record<string, unknown>;
-              }
-            }
-            const domainKeySet = new Set(
-              Object.keys((derived as any).properties),
-            );
-            const paramCorrections = autoCorrectEventParamRefs(
-              raw as any,
-              domainKeySet,
-              eventShape,
-            );
-            allComposerWarnings.push(...paramCorrections);
-
-            // Auto-correct hallucinated properties (room.name → room.displayName)
-            const deepCorrections = autoCorrectDeepParamRefs(
-              raw as any,
-              domainKeySet,
-              eventShape,
-            );
-            allComposerWarnings.push(...deepCorrections);
-          } else {
-            if (raw.params && Object.keys(raw.params).length > 0) {
-              allComposerWarnings.push(
-                `[${raw.name}] command workflow — declared params replaced with command-bridge schema.`,
-              );
-            }
-            if (raw.persistence?.stateParam) {
-              effectiveParams = {
-                ...COMMAND_BRIDGE_PARAMS,
-                properties: {
-                  ...(COMMAND_BRIDGE_PARAMS.properties as Record<
-                    string,
-                    unknown
-                  >),
-                  [(raw.persistence as { stateParam: string }).stateParam]: {
-                    type: "object",
-                    description: "Persisted state",
-                  },
-                },
-              };
-            } else {
-              effectiveParams = COMMAND_BRIDGE_PARAMS;
-            }
-          }
+          const effectiveParams = raw.params ?? {
+            type: "object",
+            properties: {},
+          };
 
           const result = composeWorkflowDefinition({
             name: raw.name,
             description: raw.description,
-            triggerEvent: raw.triggerEvent,
-            command: raw.command,
             params: effectiveParams as any,
             steps: (raw.steps as any[]).map((s: any) => {
               const { id, label, type, dependsOn, ...rest } = s;
@@ -577,7 +266,6 @@ server.registerTool(
                 ...(dependsOn ? { dependsOn } : {}),
               };
             }),
-            persistence: raw.persistence as any,
           });
           workflowDefs.push(result.workflow);
           for (const w of result.warnings) {
@@ -617,7 +305,6 @@ server.registerTool(
       const extensionRoot = dirname(dirname(fileURLToPath(import.meta.url)));
       const projectDir = join(extensionRoot, "projects", projectName);
       const mcpServerDir = join(projectDir, "mcp-server");
-      const rcAppDir = join(projectDir, "rc-app");
 
       for (const wf of workflowDefs) {
         injectEnsureChannelSteps(wf);
@@ -853,17 +540,14 @@ server.registerTool(
           serverName,
           workflowDefs,
           endpoints,
-          { bridged: needsRcApp },
         ),
         "src/rc-client.ts": generateRestClientCode(),
         "package.json": generateMcpServerPackageJson(serverName),
         "tsconfig.json": generateMcpServerTsConfig(),
         ".env.example": generateMcpServerEnvExample({
-          bridged: needsRcApp,
           usesSampling: workflowDefs.some((w) => w.usesSampling),
         }),
         ".env": generateMcpServerEnvExample({
-          bridged: needsRcApp,
           usesSampling: workflowDefs.some((w) => w.usesSampling),
         }),
         "src/tests/setup.ts": generateTestSetupCode(
@@ -900,90 +584,6 @@ server.registerTool(
       );
       writeFileSync(engineDest, readFileSync(engineSrc, "utf-8"), "utf-8");
 
-      let rcAppResult:
-        | import("./rc-app/rcAppGenerator.js").GenerateRcAppResult
-        | null = null;
-
-      if (needsRcApp) {
-        let resolvedInterfaces: import("./rc-app/types.js").AppCapability[] =
-          [];
-        let eventWorkflowMap: Record<string, string> = {};
-
-        if (hasEventWorkflows) {
-          const derivedEventInterfaces = workflowDefs
-            .filter((wf) => wf.triggerEvent)
-            .map((wf) => wf.triggerEvent!);
-          const effectiveEventInterfaces = [
-            ...new Set([
-              ...derivedEventInterfaces,
-              ...(eventInterfaceNames ?? []),
-            ]),
-          ];
-
-          if (eventInterfaceNames) {
-            const extraExplicit = eventInterfaceNames.filter(
-              (n) => !derivedEventInterfaces.includes(n),
-            );
-            for (const extra of extraExplicit) {
-              allComposerWarnings.push(
-                `eventInterfaces includes "${extra}" but no workflow has triggerEvent="${extra}" — included anyway.`,
-              );
-            }
-          }
-
-          resolvedInterfaces =
-            effectiveEventInterfaces.length > 0
-              ? getCapabilities(effectiveEventInterfaces)
-              : [];
-
-          if (effectiveEventInterfaces.length > 0) {
-            const found = new Set(
-              resolvedInterfaces.map((c) => c.interfaceName),
-            );
-            const notFound = effectiveEventInterfaces.filter(
-              (n) => !found.has(n),
-            );
-            if (notFound.length > 0) {
-              return {
-                content: [
-                  {
-                    type: "text" as const,
-                    text: `Unknown event interfaces: ${notFound.join(", ")}.\nCheck the App Events section from get_capability_guide for available interfaces.`,
-                  },
-                ],
-                isError: true,
-              };
-            }
-          }
-
-          for (const wf of workflowDefs) {
-            if (wf.triggerEvent) {
-              eventWorkflowMap[wf.triggerEvent] = wf.name;
-            }
-          }
-          const firstEventWorkflow = workflowDefs.find((wf) => wf.triggerEvent);
-          for (const iface of resolvedInterfaces) {
-            if (!eventWorkflowMap[iface.interfaceName] && firstEventWorkflow) {
-              eventWorkflowMap[iface.interfaceName] = firstEventWorkflow.name;
-              allComposerWarnings.push(
-                `Event ${iface.interfaceName} not claimed by any workflow triggerEvent — mapped to ${firstEventWorkflow.name}`,
-              );
-            }
-          }
-        }
-
-        rcAppResult = generateRcAppProject({
-          appName: projectName,
-          description: projectDescription,
-          outputDir: projectDir,
-          projectDirOverride: rcAppDir,
-          workflows: workflowDefs,
-          webhookEndpoints,
-          eventInterfaces: resolvedInterfaces,
-          eventWorkflowMap,
-        });
-      }
-
       let geminiLinked = false;
       try {
         const mcpServerName = projectName.replace(/_/g, "-");
@@ -1014,6 +614,36 @@ server.registerTool(
         // Non-fatal — user can link manually
       }
 
+      // Generate .vscode/mcp.json for VS Code Copilot
+      let vscodeMcpLinked = false;
+      try {
+        const mcpServerName = projectName.replace(/_/g, "-");
+        const vscodeMcpDir = join(projectDir, ".vscode");
+        mkdirSync(vscodeMcpDir, { recursive: true });
+        const vscodeMcpConfig = {
+          servers: {
+            [mcpServerName]: {
+              command: "node",
+              args: [
+                "--env-file-if-exists=.env",
+                "--import",
+                "tsx",
+                "src/server.ts",
+              ],
+              cwd: join(projectDir, "mcp-server"),
+            },
+          },
+        };
+        writeFileSync(
+          join(vscodeMcpDir, "mcp.json"),
+          JSON.stringify(vscodeMcpConfig, null, 2) + "\n",
+          "utf-8",
+        );
+        vscodeMcpLinked = true;
+      } catch {
+        // Non-fatal
+      }
+
       const wfFeatures: string[] = [];
       if (workflowDefs.some((w) => w.usesSampling)) wfFeatures.push("sampling");
       if (workflowDefs.some((w) => w.usesElicitation))
@@ -1034,6 +664,7 @@ server.registerTool(
 
       const treeLines = [
         `${projectName}/`,
+        `├── .vscode/mcp.json        (VS Code Copilot MCP config)`,
         `├── mcp-server/`,
         `│   ├── src/server.ts       (MCP server — stdio transport)`,
         `│   ├── src/rc-client.ts    (RC REST API client)`,
@@ -1042,23 +673,6 @@ server.registerTool(
         `│   ├── .env.example`,
         `│   └── .env               (fill in your credentials)`,
       ];
-
-      if (rcAppResult) {
-        treeLines.push(`├── rc-app/`);
-        treeLines.push(`│   ├── ${toPascalCase(projectName)}App.ts`);
-        if (rcAppResult.commands.length > 0)
-          treeLines.push(
-            `│   ├── commands/          (${rcAppResult.commands.length} slash commands)`,
-          );
-        if (rcAppResult.eventInterfaces.length > 0)
-          treeLines.push(
-            `│   ├── handlers/          (${rcAppResult.eventInterfaces.join(", ")})`,
-          );
-        treeLines.push(
-          `│   ├── bridge/            (HTTP bridge → mcp-server)`,
-          `│   └── package.json`,
-        );
-      }
 
       const tree = treeLines.filter(Boolean).join("\n  ");
 
@@ -1080,17 +694,6 @@ server.registerTool(
         `  Files: ${Object.keys(mcpFiles).length}`,
       ];
 
-      if (rcAppResult) {
-        detailParts.push(
-          ``,
-          `## RC App (bridged to MCP Server)`,
-          `  Event interfaces: ${rcAppResult.eventInterfaces.join(", ") || "none"}`,
-          `  Slash commands: ${rcAppResult.commands.join(", ") || "none"}`,
-          `  Webhooks: ${rcAppResult.webhooks.join(", ") || "none"}`,
-          `  Files: ${rcAppResult.filesWritten}`,
-        );
-      }
-
       if (geminiLinked) {
         detailParts.push(
           ``,
@@ -1100,11 +703,19 @@ server.registerTool(
         );
       }
 
+      if (vscodeMcpLinked) {
+        detailParts.push(
+          ``,
+          `## VS Code Copilot`,
+          `  ✓ Generated .vscode/mcp.json — open this project in VS Code to use the MCP tools.`,
+        );
+      }
+
       detailParts.push(
         ``,
         `## Setup`,
         `  ✓ .env pre-populated from .env.example`,
-        `  Run \`npm install\` in mcp-server/${rcAppResult ? " and rc-app/" : ""}`,
+        `  Run \`npm install\` in mcp-server/`,
       );
 
       if (allComposerWarnings.length > 0) {
@@ -1124,7 +735,7 @@ server.registerTool(
 
       // Return terse summary to LLM to avoid post-generate echoing
       const totalFiles =
-        Object.keys(mcpFiles).length + (rcAppResult?.filesWritten ?? 0) + 1; // +1 for GENERATION_NOTES.md
+        Object.keys(mcpFiles).length + 1 + (vscodeMcpLinked ? 1 : 0); // +1 for GENERATION_NOTES.md, +1 for .vscode/mcp.json
       const terseSummary = `Success. Project "${projectName}" generated at ${projectDir}. ${workflowDefs.length} workflows, ${totalFiles} files. See GENERATION_NOTES.md for setup and details.`;
 
       return {

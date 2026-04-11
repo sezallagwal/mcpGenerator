@@ -11,8 +11,6 @@ import {
   autoReturn,
   runWorkflow,
   _resetCliCache,
-  filterBotMessages,
-  shouldFilterBotMessages,
   truncateMessageFields,
   type StepDefinition,
 } from "../mcp-server/workflow-engine.js";
@@ -228,13 +226,17 @@ describe("shouldRun", () => {
   interface ExecutionState {
     params: Record<string, any>;
     stepResults: Record<string, any>;
-    stepStatus: Record<string, string>;
+    stepStatus: Record<string, "success" | "skipped" | "error">;
     stepErrors: Record<string, string>;
     completedSteps: string[];
     nextStepOverride: string | null;
     skipStep: string | null;
     stepDeps: Record<string, string[]>;
     deferredActions: any[];
+    conditionalSkips: Record<
+      string,
+      { conditional: string; runningBranchStep: string | null }
+    >;
   }
 
   function makeState(overrides?: Partial<ExecutionState>): ExecutionState {
@@ -248,6 +250,7 @@ describe("shouldRun", () => {
       skipStep: null,
       stepDeps: {},
       deferredActions: [],
+      conditionalSkips: {},
       ...overrides,
     };
   }
@@ -340,6 +343,143 @@ describe("shouldRun", () => {
     });
     assert.equal(shouldRun("merge", state), false);
     assert.equal(state.stepStatus.merge, undefined);
+  });
+
+  // ── Phase 1.5: Ancestor-based convergence detection ──────────────────
+  it("propagates skip for branch-exclusive step (no convergence)", () => {
+    // Conditional skips thenStep, step depends only on thenStep.
+    // Running branch (elseStep) is NOT an ancestor of step → propagate skip.
+    const state = makeState({
+      stepDeps: { select: ["confirm", "rank"], rank: [] },
+      stepStatus: { confirm: "skipped", rank: "success" },
+      stepResults: { confirm: null, rank: "data" },
+      completedSteps: ["rank"],
+      conditionalSkips: {
+        confirm: {
+          conditional: "has_inactive",
+          runningBranchStep: "report_clean",
+        },
+      },
+    });
+    assert.equal(shouldRun("select", state), false);
+    assert.equal(state.stepStatus.select, "skipped");
+  });
+
+  it("allows convergence when running branch is ancestor", () => {
+    // Conditional: has_inactive → THEN=confirm, ELSE=report_clean (skipped)
+    // Step "final" depends on [confirm, report_clean].
+    // confirm completed, report_clean skipped.
+    // Running branch step for report_clean is "confirm" which IS an ancestor of "final" → converge.
+    const state = makeState({
+      stepDeps: { final: ["confirm", "report_clean"] },
+      stepStatus: { confirm: "success", report_clean: "skipped" },
+      stepResults: { confirm: "ok", report_clean: null },
+      completedSteps: ["confirm"],
+      conditionalSkips: {
+        report_clean: {
+          conditional: "has_inactive",
+          runningBranchStep: "confirm",
+        },
+      },
+    });
+    assert.equal(shouldRun("final", state), true);
+  });
+
+  it("propagates skip through chain from branch-exclusive dep", () => {
+    // confirm skipped by conditional (running branch = report_clean).
+    // select depends on [confirm, rank]. report_clean is NOT ancestor of select → skip.
+    // archive depends on [select] → should cascade skip too.
+    const state = makeState({
+      stepDeps: { select: ["confirm", "rank"], archive: ["select"] },
+      stepStatus: { confirm: "skipped", rank: "success" },
+      stepResults: { confirm: null, rank: "data" },
+      completedSteps: ["rank"],
+      conditionalSkips: {
+        confirm: {
+          conditional: "has_inactive",
+          runningBranchStep: "report_clean",
+        },
+      },
+    });
+    assert.equal(shouldRun("select", state), false);
+    assert.equal(state.stepStatus.select, "skipped");
+    // Now archive should cascade-skip since its only dep (select) is skipped
+    assert.equal(shouldRun("archive", state), false);
+    assert.equal(state.stepStatus.archive, "skipped");
+  });
+
+  it("handles conditional with null runningBranchStep (one-armed)", () => {
+    // Conditional: check → THEN=doIt, ELSE=null. check=FALSE → skip doIt.
+    // doIt has runningBranchStep=null → always propagate skip (no convergence possible).
+    const state = makeState({
+      stepDeps: { after_doIt: ["doIt"] },
+      stepStatus: { doIt: "skipped" },
+      stepResults: { doIt: null },
+      conditionalSkips: {
+        doIt: { conditional: "check", runningBranchStep: null },
+      },
+    });
+    assert.equal(shouldRun("after_doIt", state), false);
+    assert.equal(state.stepStatus.after_doIt, "skipped");
+  });
+
+  it("convergence: diamond pattern with conditional", () => {
+    // conditional → THEN=A (runs), ELSE=B (skipped, running=A)
+    // C depends on [A, B] → A is ancestor of C → convergence → run
+    const state = makeState({
+      stepDeps: { C: ["A", "B"], A: [] },
+      stepStatus: { A: "success", B: "skipped" },
+      stepResults: { A: "data", B: null },
+      completedSteps: ["A"],
+      conditionalSkips: {
+        B: { conditional: "cond", runningBranchStep: "A" },
+      },
+    });
+    assert.equal(shouldRun("C", state), true);
+  });
+
+  it("two independent conditionals: both skip propagate", () => {
+    // cond1 skips branch1_step, cond2 skips branch2_step.
+    // merge depends on [branch1_step, branch2_step]. Both skipped with no convergence.
+    const state = makeState({
+      stepDeps: { merge: ["b1", "b2"] },
+      stepStatus: { b1: "skipped", b2: "skipped" },
+      stepResults: { b1: null, b2: null },
+      conditionalSkips: {
+        b1: { conditional: "cond1", runningBranchStep: "alt1" },
+        b2: { conditional: "cond2", runningBranchStep: "alt2" },
+      },
+    });
+    assert.equal(shouldRun("merge", state), false);
+    assert.equal(state.stepStatus.merge, "skipped");
+  });
+
+  it("mixed: one branch-exclusive skip + one succeeded dep → propagates", () => {
+    // dep_a succeeded, dep_b skipped by conditional (no convergence).
+    // Phase 1.5 sees dep_b is branch-exclusive → propagate skip.
+    const state = makeState({
+      stepDeps: { step: ["dep_a", "dep_b"] },
+      stepStatus: { dep_a: "success", dep_b: "skipped" },
+      stepResults: { dep_a: "ok", dep_b: null },
+      completedSteps: ["dep_a"],
+      conditionalSkips: {
+        dep_b: { conditional: "cond", runningBranchStep: "other_branch" },
+      },
+    });
+    assert.equal(shouldRun("step", state), false);
+    assert.equal(state.stepStatus.step, "skipped");
+  });
+
+  it("non-conditional skip still cascades normally (Phase 2)", () => {
+    // dep skipped but NOT in conditionalSkips → Phase 1.5 ignores it,
+    // Phase 2 all-skipped cascade handles it.
+    const state = makeState({
+      stepDeps: { s2: ["s1"] },
+      stepStatus: { s1: "skipped" },
+      stepResults: { s1: null },
+    });
+    assert.equal(shouldRun("s2", state), false);
+    assert.equal(state.stepStatus.s2, "skipped");
   });
 });
 
@@ -2362,138 +2502,6 @@ describe("outputPath extraction (no double-apply)", () => {
   });
 });
 
-// ── Bot message filtering ─────────────────────────────────────────────────
-
-describe("shouldFilterBotMessages", () => {
-  it("matches chat_search", () => {
-    assert.ok(shouldFilterBotMessages("get-api-v1-chat_search"));
-  });
-
-  it("matches channels_history", () => {
-    assert.ok(shouldFilterBotMessages("get-api-v1-channels_history"));
-  });
-
-  it("matches channels_messages", () => {
-    assert.ok(shouldFilterBotMessages("get-api-v1-channels_messages"));
-  });
-
-  it("matches groups_history", () => {
-    assert.ok(shouldFilterBotMessages("get-api-v1-groups_history"));
-  });
-
-  it("matches im_history", () => {
-    assert.ok(shouldFilterBotMessages("get-api-v1-im_history"));
-  });
-
-  it("matches chat_getPinnedMessages", () => {
-    assert.ok(shouldFilterBotMessages("get-api-v1-chat_getPinnedMessages"));
-  });
-
-  it("matches chat_getStarredMessages", () => {
-    assert.ok(shouldFilterBotMessages("get-api-v1-chat_getStarredMessages"));
-  });
-
-  it("does NOT match channels_create", () => {
-    assert.ok(!shouldFilterBotMessages("post-api-v1-channels_create"));
-  });
-
-  it("does NOT match chat_postMessage", () => {
-    assert.ok(!shouldFilterBotMessages("post-api-v1-chat_postMessage"));
-  });
-
-  it("does NOT match chat_sendMessage", () => {
-    assert.ok(!shouldFilterBotMessages("post-api-v1-chat_sendMessage"));
-  });
-
-  it("returns false for undefined operationId", () => {
-    assert.ok(!shouldFilterBotMessages(undefined));
-  });
-});
-
-describe("filterBotMessages", () => {
-  it("removes bot messages from messages array", () => {
-    const result = {
-      messages: [
-        { _id: "1", msg: "hello", u: { username: "alice" } },
-        { _id: "2", msg: "⏳ Running /kb test", u: { username: "kb-bot" } },
-        { _id: "3", msg: "world", u: { username: "bob" } },
-      ],
-      count: 3,
-    };
-    filterBotMessages(result, new Set(["kb-bot"]));
-    assert.equal(result.messages.length, 2);
-    assert.equal(result.messages[0]._id, "1");
-    assert.equal(result.messages[1]._id, "3");
-  });
-
-  it("is no-op when botUsernames is empty", () => {
-    const result = {
-      messages: [
-        { _id: "1", msg: "hello", u: { username: "alice" } },
-        { _id: "2", msg: "bot msg", u: { username: "kb-bot" } },
-      ],
-    };
-    filterBotMessages(result, new Set());
-    assert.equal(result.messages.length, 2);
-  });
-
-  it("is no-op when result has no messages array", () => {
-    const result = { channels: [{ _id: "c1" }] };
-    filterBotMessages(result, new Set(["kb-bot"]));
-    assert.equal(result.channels.length, 1);
-  });
-
-  it("handles result that is not an object", () => {
-    const result = filterBotMessages("just a string", new Set(["kb-bot"]));
-    assert.equal(result, "just a string");
-  });
-
-  it("handles null result", () => {
-    const result = filterBotMessages(null, new Set(["kb-bot"]));
-    assert.equal(result, null);
-  });
-
-  it("removes RC App bot messages (.bot variant)", () => {
-    const result = {
-      messages: [
-        { _id: "1", msg: "hello", u: { username: "alice" } },
-        { _id: "2", msg: "⏳ Running /kb test", u: { username: "kb.bot" } },
-        { _id: "3", msg: "world", u: { username: "bob" } },
-      ],
-    };
-    filterBotMessages(result, new Set(["kb.bot", "kb-bot"]));
-    assert.equal(result.messages.length, 2);
-    assert.equal(result.messages[0]._id, "1");
-    assert.equal(result.messages[1]._id, "3");
-  });
-
-  it("removes both MCP bot and App bot messages simultaneously", () => {
-    const result = {
-      messages: [
-        { _id: "1", msg: "hello", u: { username: "alice" } },
-        {
-          _id: "2",
-          msg: "status",
-          u: { username: "knowledge-base-search.bot" },
-        },
-        {
-          _id: "3",
-          msg: "api call",
-          u: { username: "knowledge-base-search-bot" },
-        },
-        { _id: "4", msg: "world", u: { username: "bob" } },
-      ],
-    };
-    filterBotMessages(
-      result,
-      new Set(["knowledge-base-search.bot", "knowledge-base-search-bot"]),
-    );
-    assert.equal(result.messages.length, 2);
-    assert.equal(result.messages[0]._id, "1");
-    assert.equal(result.messages[1]._id, "4");
-  });
-});
-
 describe("truncateMessageFields", () => {
   it("truncates msg field for chat_sendMessage", () => {
     const payload = {
@@ -2534,121 +2542,6 @@ describe("truncateMessageFields", () => {
     const payload: Record<string, unknown> = { msg: "a".repeat(5000) };
     truncateMessageFields(payload, undefined);
     assert.equal((payload.msg as string).length, 5000);
-  });
-});
-
-describe("bot message filtering in workflow execution", () => {
-  it("filters bot messages from chat_search results when botUsernames is set", async () => {
-    const steps: StepDefinition[] = [
-      {
-        id: "search",
-        label: "Search messages",
-        type: "api_call",
-        dependsOn: [],
-        operationId: "get-api-v1-chat_search",
-        inputMapping: { roomId: "room1", searchText: "test" },
-      },
-    ];
-
-    const mockClient = {
-      request: async () => ({
-        isError: false,
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              messages: [
-                { _id: "1", msg: "real result", u: { username: "alice" } },
-                {
-                  _id: "2",
-                  msg: "⏳ Running /kb test",
-                  u: { username: "test-bot" },
-                },
-                { _id: "3", msg: "another real", u: { username: "bob" } },
-              ],
-            }),
-          },
-        ],
-      }),
-    };
-
-    const result = await runWorkflow(
-      {
-        server: {},
-        client: mockClient,
-        endpoints: {
-          "get-api-v1-chat_search": {
-            method: "GET",
-            path: "/api/v1/chat.search",
-          },
-        },
-        name: "test",
-        botUsernames: ["test-bot"],
-      },
-      steps,
-      { roomId: "room1", searchText: "test" },
-    );
-
-    const parsed = JSON.parse(result.content[0].text);
-    const messages = parsed.stepResults.search.messages;
-    assert.equal(messages.length, 2, "bot message should be filtered out");
-    assert.equal(messages[0]._id, "1");
-    assert.equal(messages[1]._id, "3");
-  });
-
-  it("does NOT filter when botUsernames is not set", async () => {
-    const steps: StepDefinition[] = [
-      {
-        id: "search",
-        label: "Search messages",
-        type: "api_call",
-        dependsOn: [],
-        operationId: "get-api-v1-chat_search",
-        inputMapping: { roomId: "room1", searchText: "test" },
-      },
-    ];
-
-    const mockClient = {
-      request: async () => ({
-        isError: false,
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              messages: [
-                { _id: "1", msg: "real result", u: { username: "alice" } },
-                { _id: "2", msg: "bot msg", u: { username: "test-bot" } },
-              ],
-            }),
-          },
-        ],
-      }),
-    };
-
-    const result = await runWorkflow(
-      {
-        server: {},
-        client: mockClient,
-        endpoints: {
-          "get-api-v1-chat_search": {
-            method: "GET",
-            path: "/api/v1/chat.search",
-          },
-        },
-        name: "test",
-        // no botUsernames
-      },
-      steps,
-      { roomId: "room1", searchText: "test" },
-    );
-
-    const parsed = JSON.parse(result.content[0].text);
-    const messages = parsed.stepResults.search.messages;
-    assert.equal(
-      messages.length,
-      2,
-      "should keep all messages without botUsernames",
-    );
   });
 });
 

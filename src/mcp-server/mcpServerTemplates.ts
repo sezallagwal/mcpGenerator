@@ -8,12 +8,9 @@ export function generateRestClientCode(): string {
  *
  * Centralizes HTTP communication with the Rocket.Chat server.
  * Auth priority:
- *   1. Pre-existing tokens (ROCKETCHAT_AUTH_TOKEN + ROCKETCHAT_USER_ID) — bot credentials, no login needed
- *   2. Username/password (ROCKETCHAT_USER + ROCKETCHAT_PASSWORD) — admin credentials, auto-login
+ *   1. Pre-existing tokens (ROCKETCHAT_AUTH_TOKEN + ROCKETCHAT_USER_ID) — use directly
+ *   2. Username/password (ROCKETCHAT_USER + ROCKETCHAT_PASSWORD) — auto-login
  *   3. Unconfigured mode — server runs but tools prompt for setup
- *
- * On first run with admin credentials, the auto-config creates a dedicated
- * bot user and writes its token to .env. Subsequent runs use the token directly.
  *
  * All tool handlers use client.request() instead of raw fetch.
  */
@@ -49,8 +46,8 @@ let initialized = false;
 /**
  * Authenticate with Rocket.Chat at startup.
  * Priority:
- *   1. ROCKETCHAT_AUTH_TOKEN + ROCKETCHAT_USER_ID → use directly (bot token)
- *   2. ROCKETCHAT_USER + ROCKETCHAT_PASSWORD → auto-login (admin, for initial setup)
+ *   1. ROCKETCHAT_AUTH_TOKEN + ROCKETCHAT_USER_ID → use directly (token auth)
+ *   2. ROCKETCHAT_USER + ROCKETCHAT_PASSWORD → auto-login
  *   3. Neither → unconfigured mode
  */
 export let authConfigured = false;
@@ -59,14 +56,14 @@ export async function initAuth(): Promise<void> {
   if (initialized) return;
   initialized = true;
 
-  // Mode 1: pre-existing tokens (bot credentials — takes priority)
+  // Mode 1: pre-existing tokens (takes priority)
   if (config.authToken && config.userId) {
     authConfigured = true;
     console.error("Using pre-existing auth tokens.");
     return;
   }
 
-  // Mode 2: username/password → auto-login (admin, for initial bot setup)
+  // Mode 2: username/password → auto-login
   const user = process.env.ROCKETCHAT_USER || "";
   const password = process.env.ROCKETCHAT_PASSWORD || "";
 
@@ -187,19 +184,18 @@ export function generateMcpServerTsConfig(): string {
 }
 
 export function generateMcpServerEnvExample(options?: {
-  bridged?: boolean;
   usesSampling?: boolean;
 }): string {
   let env = `# Rocket.Chat connection settings
 ROCKETCHAT_URL=http://localhost:3000
 
-# Admin credentials (used for initial bot setup on first run)
-ROCKETCHAT_USER=your-admin-username
-ROCKETCHAT_PASSWORD=your-admin-password
+# Your Rocket.Chat credentials (the MCP server acts as YOU)
+ROCKETCHAT_USER=your-username
+ROCKETCHAT_PASSWORD=your-password
 
-# Bot credentials (auto-generated on first run — takes priority when set)
-# ROCKETCHAT_AUTH_TOKEN=auto-generated-on-first-run
-# ROCKETCHAT_USER_ID=auto-generated-on-first-run
+# Or use token auth directly (takes priority over username/password)
+# ROCKETCHAT_AUTH_TOKEN=
+# ROCKETCHAT_USER_ID=
 `;
 
   if (options?.usesSampling) {
@@ -211,13 +207,6 @@ ROCKETCHAT_PASSWORD=your-admin-password
 # Fallback: Direct API key (500 requests/day free tier).
 #   Get one at https://aistudio.google.com/apikey
 # GEMINI_API_KEY=your-api-key-here
-`;
-  }
-
-  if (options?.bridged) {
-    env += `
-# HTTP bridge port for RC App connections
-MCP_HTTP_PORT=3001
 `;
   }
 
